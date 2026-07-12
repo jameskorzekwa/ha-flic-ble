@@ -1,7 +1,7 @@
 {
   "domain": "flic2",
   "name": "Flic 2 Bluetooth",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "codeowners": ["@jameskorzekwa"],
   "config_flow": true,
   "dependencies": ["bluetooth"],

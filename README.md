@@ -16,7 +16,7 @@ Supported:
 - Flic Duo big and small buttons through the extended Duo protocol
 - Single, double, hold, and four-direction swipe events
 - ESPHome Bluetooth proxy connection routing and failover
-- On-demand connections with a 60-second idle disconnect to conserve proxy slots
+- On-demand connections with a local idle watchdog to prevent stale proxy slots
 - Battery voltage reporting
 
 Not supported:
