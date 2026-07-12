@@ -154,6 +154,12 @@ class DuoDecodeResult:
     last_timestamp: int
     end_of_queue: bool
     needs_ack: bool
+    hold_states: tuple[int, int]
+
+
+_HOLD_NONE = 0
+_HOLD_ACTIVE = 1
+_HOLD_RELEASED = 2
 
 
 class _BitReader:
@@ -194,11 +200,13 @@ def decode_duo_button_events(
     event_counts: tuple[int, int],
     last_timestamp: int,
     end_of_queue: bool,
+    hold_states: tuple[int, int] = (_HOLD_NONE, _HOLD_NONE),
 ) -> DuoDecodeResult:
     """Decode Flic Duo button and swipe updates."""
     reader = _BitReader(payload)
     counts = [event_counts[0], event_counts[1]]
     got_event_count = [False, False]
+    holds = [hold_states[0], hold_states[1]]
     events: list[ButtonEvent] = []
     needs_ack = False
 
@@ -252,10 +260,25 @@ def decode_duo_button_events(
         event_count = counts[button_number]
         button = "small" if button_number else "big"
         event_type: str | None = None
+        suppress_click_after_hold = False
+        if event_code == 5:
+            # A new physical press always starts a new gesture sequence.
+            holds[button_number] = _HOLD_NONE
+        elif event_code == 7 and not next_up_will_be_double:
+            holds[button_number] = _HOLD_ACTIVE
+        elif event_code <= 4 and holds[button_number] != _HOLD_NONE:
+            # The release belongs to the hold already emitted to HA. Keep a
+            # marker for a possible single-click-timeout update that can
+            # arrive in a later notification.
+            suppress_click_after_hold = True
+            holds[button_number] = _HOLD_RELEASED
+        elif event_code == 6 and holds[button_number] != _HOLD_NONE:
+            suppress_click_after_hold = True
+            if holds[button_number] == _HOLD_RELEASED:
+                holds[button_number] = _HOLD_NONE
+
         if event_code <= 4:
-            was_hold = event_code == 2 or (
-                event_code == 4 and double_click_was_hold
-            )
+            was_hold = event_code == 2 or (event_code == 4 and double_click_was_hold)
             single_click = event_code in (1, 2)
             double_click = event_code in (3, 4)
             if single_click:
@@ -271,6 +294,9 @@ def decode_duo_button_events(
             needs_ack = True
         elif event_code == 7 and not next_up_will_be_double:
             event_type = "hold"
+
+        if suppress_click_after_hold:
+            event_type = None
 
         recognized_gesture = gesture in ("left", "right", "up", "down")
         if recognized_gesture:
@@ -311,6 +337,7 @@ def decode_duo_button_events(
         last_timestamp,
         end_of_queue,
         needs_ack,
+        (holds[0], holds[1]),
     )
 
 
@@ -367,9 +394,7 @@ def chaskey_16(key: bytes, message: bytes) -> bytes:
     return struct.pack("<4I", *(v[i] ^ keys[i + 4] for i in range(4)))
 
 
-def chaskey_signature(
-    key: bytes, direction: int, counter: int, packet: bytes
-) -> bytes:
+def chaskey_signature(key: bytes, direction: int, counter: int, packet: bytes) -> bytes:
     """Calculate Flic's five-byte signed-packet authenticator."""
     if not packet:
         raise ValueError("Cannot sign an empty packet")
@@ -514,6 +539,7 @@ class Flic2Session:
         self._is_duo = False
         self._duo_last_timestamp = 0
         self._duo_end_of_queue = False
+        self._duo_hold_states = (_HOLD_NONE, _HOLD_NONE)
 
     async def start(self) -> None:
         """Start full pairing or quick verification."""
@@ -521,8 +547,7 @@ class Flic2Session:
         if self.result.pairing is None:
             self.state = SessionState.WAIT_FULL_VERIFY_1
             await self._send_unsigned(
-                bytes([OP_FULL_VERIFY_REQUEST_1])
-                + struct.pack("<I", self._tmp_id)
+                bytes([OP_FULL_VERIFY_REQUEST_1]) + struct.pack("<I", self._tmp_id)
             )
             return
         self.state = SessionState.WAIT_QUICK_VERIFY
@@ -694,9 +719,9 @@ class Flic2Session:
             + self._client_random
             + bytes([request_flags])
         ).digest()
-        verifier = hmac.new(
-            self._full_verify_hmac_key, b"AT", hashlib.sha256
-        ).digest()[:16]
+        verifier = hmac.new(self._full_verify_hmac_key, b"AT", hashlib.sha256).digest()[
+            :16
+        ]
         self._session_key = hmac.new(
             self._full_verify_hmac_key, b"SK", hashlib.sha256
         ).digest()[:16]
@@ -835,8 +860,8 @@ class Flic2Session:
                 raise Flic2ProtocolError("Malformed Flic Duo init response")
             packed_time = int.from_bytes(data[:6], "little")
             has_queued = bool(packed_time & 1)
-            self.result.event_count, self.result.event_count_small = (
-                struct.unpack_from("<II", data, 6)
+            self.result.event_count, self.result.event_count_small = struct.unpack_from(
+                "<II", data, 6
             )
             if opcode == OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID:
                 if len(data) < 18:
@@ -844,6 +869,7 @@ class Flic2Session:
                 self.result.boot_id = struct.unpack_from("<I", data, 14)[0]
             self._duo_last_timestamp = 0
             self._duo_end_of_queue = not has_queued
+            self._duo_hold_states = (_HOLD_NONE, _HOLD_NONE)
             self.ready.set()
             self._notify_state()
         elif opcode == OP_BUTTON_EVENT_NOTIFICATION:
@@ -866,12 +892,14 @@ class Flic2Session:
                 (self.result.event_count, self.result.event_count_small),
                 self._duo_last_timestamp,
                 self._duo_end_of_queue,
+                self._duo_hold_states,
             )
             self.result.event_count, self.result.event_count_small = (
                 decoded.event_counts
             )
             self._duo_last_timestamp = decoded.last_timestamp
             self._duo_end_of_queue = decoded.end_of_queue
+            self._duo_hold_states = decoded.hold_states
             self._notify_state()
             for event in decoded.events:
                 if self._event_callback:

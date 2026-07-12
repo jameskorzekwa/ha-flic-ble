@@ -121,17 +121,20 @@ def test_decode_duo_big_single_and_swipe_left() -> None:
 
 
 def test_duo_decoder_ignores_final_padding_byte() -> None:
-    payload = _packed_bits(
-        (0, 1),
-        (0, 1),
-        (0, 3),
-        (5, 8),
-        (1, 3),
-        (0, 1),
-        (0, 8),
-        (0, 8),
-        (64, 8),
-    ) + b"\x00"
+    payload = (
+        _packed_bits(
+            (0, 1),
+            (0, 1),
+            (0, 3),
+            (5, 8),
+            (1, 3),
+            (0, 1),
+            (0, 8),
+            (0, 8),
+            (64, 8),
+        )
+        + b"\x00"
+    )
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
@@ -199,6 +202,96 @@ def test_decode_duo_small_button_hold() -> None:
     assert decoded.event_counts == (12, 21)
     assert decoded.last_timestamp == 109
     assert not decoded.needs_ack
+
+
+def test_duo_hold_suppresses_release_and_click_timeout_across_packets() -> None:
+    hold_payload = _packed_bits(
+        (0, 1),  # big button
+        (0, 1),
+        (0, 3),
+        (5, 8),
+        (7, 3),  # hold
+        (0, 1),
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+    hold = decode_duo_button_events(hold_payload, (0, 0), 0, True)
+    assert [event.event_type for event in hold.events] == ["hold"]
+
+    release_payload = _packed_bits(
+        (0, 1),
+        (0, 1),
+        (2, 3),
+        (1100, 13),
+        (2, 3),  # release after at least one second
+        (0, 1),  # no gesture
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+    release = decode_duo_button_events(
+        release_payload,
+        hold.event_counts,
+        hold.last_timestamp,
+        hold.end_of_queue,
+        hold.hold_states,
+    )
+    assert release.events == []
+
+    timeout_payload = _packed_bits(
+        (0, 1),
+        (0, 1),
+        (0, 3),
+        (5, 8),
+        (6, 3),  # stale single-click timeout for the held press
+        (0, 1),
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+    timeout = decode_duo_button_events(
+        timeout_payload,
+        release.event_counts,
+        release.last_timestamp,
+        release.end_of_queue,
+        release.hold_states,
+    )
+    assert timeout.events == []
+
+
+def test_duo_click_after_hold_starts_a_new_sequence() -> None:
+    down_payload = _packed_bits(
+        (0, 1),
+        (0, 1),
+        (0, 3),
+        (5, 8),
+        (5, 3),  # new button down clears stale hold suppression
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+    down = decode_duo_button_events(down_payload, (2, 0), 100, True, (2, 0))
+
+    single_payload = _packed_bits(
+        (0, 1),
+        (0, 1),
+        (0, 3),
+        (100, 8),
+        (1, 3),
+        (0, 1),
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+    single = decode_duo_button_events(
+        single_payload,
+        down.event_counts,
+        down.last_timestamp,
+        down.end_of_queue,
+        down.hold_states,
+    )
+    assert [event.event_type for event in single.events] == ["single"]
 
 
 def test_decode_multiple_duo_updates_from_one_packet() -> None:
