@@ -36,8 +36,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
-_LOCAL_IDLE_DISCONNECT_SECONDS = 50
 _CONNECT_ATTEMPT_TIMEOUT_SECONDS = 75
+_INFINITE_AUTO_DISCONNECT_TIME = 511
 
 
 class Flic2Device:
@@ -56,8 +56,6 @@ class Flic2Device:
         self._event_listeners: set[Callable[[ButtonEvent], None]] = set()
         self._state_listeners: set[Callable[[], None]] = set()
         self._stopping = False
-        self._last_activity = 0.0
-        self._idle_disconnect_task: asyncio.Task[None] | None = None
 
     async def async_start(self) -> None:
         """Start listening for advertisements and connect when reachable."""
@@ -123,7 +121,6 @@ class Flic2Device:
             def _disconnected(_: Any) -> None:
                 self._client = None
                 self.available = False
-                self._cancel_idle_disconnect()
                 self._notify_state_listeners()
 
             try:
@@ -138,7 +135,6 @@ class Flic2Device:
                         await self._client.disconnect()
                 self._client = None
                 self.available = False
-                self._cancel_idle_disconnect()
                 self._notify_state_listeners()
 
     async def _async_establish_session(
@@ -158,8 +154,6 @@ class Flic2Device:
             use_services_cache=True,
         )
         self._client = client
-        self._mark_activity()
-        self._start_idle_disconnect(client)
 
         async def _send(payload: bytes) -> None:
             await client.write_gatt_char(TX_UUID, payload, response=False)
@@ -178,7 +172,7 @@ class Flic2Device:
             event_callback=self._handle_event,
             state_callback=self._handle_state,
             mtu=getattr(client, "mtu_size", 23),
-            auto_disconnect_time=60,
+            auto_disconnect_time=_INFINITE_AUTO_DISCONNECT_TIME,
         )
 
         async def _process_notification(data: bytes) -> None:
@@ -191,7 +185,6 @@ class Flic2Device:
                         await client.disconnect()
 
         def _notification(_: Any, data: bytearray) -> None:
-            self._mark_activity()
             self.hass.async_create_task(_process_notification(bytes(data)))
 
         await client.start_notify(RX_UUID, _notification)
@@ -202,42 +195,6 @@ class Flic2Device:
             raise session.failure
         self.available = True
         self._notify_state_listeners()
-
-    @callback
-    def _mark_activity(self) -> None:
-        self._last_activity = asyncio.get_running_loop().time()
-
-    @callback
-    def _start_idle_disconnect(self, client: BleakClientWithServiceCache) -> None:
-        self._cancel_idle_disconnect()
-        self._idle_disconnect_task = self.hass.async_create_task(
-            self._async_idle_disconnect(client)
-        )
-
-    @callback
-    def _cancel_idle_disconnect(self) -> None:
-        task = self._idle_disconnect_task
-        self._idle_disconnect_task = None
-        if task and task is not asyncio.current_task():
-            task.cancel()
-
-    async def _async_idle_disconnect(self, client: BleakClientWithServiceCache) -> None:
-        """Release a quiet BLE link before the button's own idle timeout."""
-        try:
-            while self._client is client and client.is_connected:
-                idle_for = asyncio.get_running_loop().time() - self._last_activity
-                remaining = _LOCAL_IDLE_DISCONNECT_SECONDS - idle_for
-                if remaining <= 0:
-                    await client.disconnect()
-                    return
-                await asyncio.sleep(remaining)
-        except asyncio.CancelledError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Unable to close idle Flic 2 link: %s", err)
-        finally:
-            if self._idle_disconnect_task is asyncio.current_task():
-                self._idle_disconnect_task = None
 
     @callback
     def _handle_event(self, event: ButtonEvent) -> None:
@@ -288,7 +245,6 @@ class Flic2Device:
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await connect_task
-        self._cancel_idle_disconnect()
         if self._client:
             with contextlib.suppress(Exception):
                 await self._client.disconnect()
