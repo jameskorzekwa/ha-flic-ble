@@ -31,3 +31,5 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+      - name: Verify release archive
+        run: bash .github/scripts/build_release.sh
