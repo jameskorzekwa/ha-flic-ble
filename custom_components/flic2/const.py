@@ -15,7 +15,23 @@ CONF_BUTTON_UUID = "button_uuid"
 CONF_SERIAL_NUMBER = "serial_number"
 CONF_FIRMWARE_VERSION = "firmware_version"
 CONF_EVENT_COUNT = "event_count"
+CONF_EVENT_COUNT_SMALL = "event_count_small"
 CONF_BOOT_ID = "boot_id"
+CONF_IS_DUO = "is_duo"
 
-EVENT_TYPES = ["single", "double", "hold"]
-
+EVENT_TYPES = [
+    "single",
+    "double",
+    "hold",
+    "swipe_left",
+    "swipe_right",
+    "swipe_up",
+    "swipe_down",
+    "small_single",
+    "small_double",
+    "small_hold",
+    "small_swipe_left",
+    "small_swipe_right",
+    "small_swipe_up",
+    "small_swipe_down",
+]

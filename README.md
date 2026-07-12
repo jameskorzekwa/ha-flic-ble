@@ -13,8 +13,8 @@ validation against physical buttons and ESPHome proxies before production use.
 Supported:
 
 - Flic 2 buttons
-- Flic Duo's main button through the base Flic 2 protocol
-- Single, double, and hold events
+- Flic Duo big and small buttons through the extended Duo protocol
+- Single, double, hold, and four-direction swipe events
 - ESPHome Bluetooth proxy connection routing and failover
 - On-demand connections with a 60-second idle disconnect to conserve proxy slots
 - Battery voltage reporting
@@ -22,7 +22,7 @@ Supported:
 Not supported:
 
 - Original Flic 1 buttons (their protocol is not publicly documented)
-- Flic Duo twist/small-button extensions
+- Flic Duo push-twist and fall-detection extensions
 - Firmware updates
 - HID/MIDI configuration
 
@@ -59,8 +59,11 @@ of inactivity. This avoids permanently reserving one proxy slot per button.
 
 ## Event automations
 
-Each button creates an Event entity with event types `single`, `double`, and
-`hold`. Use that Event entity as an automation trigger in the Home Assistant UI.
+Each button creates an Event entity. Big-button events are `single`, `double`,
+`hold`, and `swipe_left`/`right`/`up`/`down`. Small-button event names use the
+`small_` prefix, such as `small_single` and `small_swipe_left`. Event data also
+includes the physical button, recognized gesture, event counter, timestamp,
+queue status, and Duo acceleration vector.
 
 ## Security and protocol provenance
 
@@ -73,3 +76,6 @@ The Chaskey packet-authentication code was translated from Shortcut Labs AB's
 permissively licensed Android reference library. See `NOTICE` and
 `FLIC_LICENSE.txt`.
 
+Flic Duo support follows the officially published
+[Flic Duo Protocol Specification](https://github.com/50ButtonsEach/flic2-documentation/wiki/Flic-Duo-Protocol-Specification)
+and its Android reference implementation.

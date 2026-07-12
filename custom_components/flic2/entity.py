@@ -4,7 +4,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 
-from .const import CONF_FIRMWARE_VERSION, CONF_SERIAL_NUMBER, DOMAIN
+from .const import CONF_FIRMWARE_VERSION, CONF_IS_DUO, CONF_SERIAL_NUMBER, DOMAIN
 
 
 class Flic2Entity(Entity):
@@ -18,7 +18,7 @@ class Flic2Entity(Entity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.unique_id or self.device.address)},
             manufacturer="Flic",
-            model="Flic 2",
+            model="Flic Duo" if entry.data.get(CONF_IS_DUO) else "Flic 2",
             name=entry.title,
             serial_number=entry.data.get(CONF_SERIAL_NUMBER),
             sw_version=str(entry.data.get(CONF_FIRMWARE_VERSION, "")),

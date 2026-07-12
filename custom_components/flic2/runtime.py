@@ -16,6 +16,8 @@ from homeassistant.core import HomeAssistant, callback
 from .const import (
     CONF_BOOT_ID,
     CONF_EVENT_COUNT,
+    CONF_EVENT_COUNT_SMALL,
+    CONF_IS_DUO,
     CONF_PAIRING_IDENTIFIER,
     CONF_PAIRING_KEY,
     RX_UUID,
@@ -123,6 +125,7 @@ class Flic2Device:
                     _send,
                     pairing=pairing,
                     event_count=self.entry.data.get(CONF_EVENT_COUNT, 0),
+                    event_count_small=self.entry.data.get(CONF_EVENT_COUNT_SMALL, 0),
                     boot_id=self.entry.data.get(CONF_BOOT_ID, 0),
                     event_callback=self._handle_event,
                     state_callback=self._handle_state,
@@ -159,7 +162,9 @@ class Flic2Device:
         data = {
             **self.entry.data,
             CONF_EVENT_COUNT: result.event_count,
+            CONF_EVENT_COUNT_SMALL: result.event_count_small,
             CONF_BOOT_ID: result.boot_id,
+            CONF_IS_DUO: result.is_duo,
         }
         if self.battery_voltage is not None:
             data["battery_voltage"] = self.battery_voltage

@@ -1,7 +1,7 @@
 {
   "domain": "flic2",
   "name": "Flic 2 Bluetooth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "codeowners": ["@jameskorzekwa"],
   "config_flow": true,
   "dependencies": ["bluetooth"],
@@ -15,4 +15,3 @@
     }
   ]
 }
-

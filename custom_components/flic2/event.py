@@ -40,12 +40,24 @@ class Flic2EventEntity(Flic2Entity, EventEntity):
 
     @callback
     def _handle_event(self, event: ButtonEvent) -> None:
+        event_data = {
+            "button": event.button,
+            "gesture": event.gesture,
+            "queued": event.queued,
+            "event_count": event.event_count,
+            "button_timestamp_ms": event.timestamp_ms,
+        }
+        if event.accelerometer is not None:
+            x, y, z = event.accelerometer
+            event_data.update(
+                {
+                    "acceleration_x_g": round(x / 64.036875, 3),
+                    "acceleration_y_g": round(y / 64.036875, 3),
+                    "acceleration_z_g": round(z / 64.036875, 3),
+                }
+            )
         self._trigger_event(
             event.event_type,
-            {
-                "queued": event.queued,
-                "event_count": event.event_count,
-                "button_timestamp_ms": event.timestamp_ms,
-            },
+            event_data,
         )
         self.async_write_ha_state()

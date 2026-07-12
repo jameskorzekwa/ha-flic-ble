@@ -17,12 +17,22 @@ from custom_components.flic2.protocol import (
     chaskey_signature,
     chaskey_subkeys,
     decode_button_events,
+    decode_duo_button_events,
 )
 
 
 def _event_item(encoded: int, *, queued: bool = False, timestamp: int = 32768) -> bytes:
     raw = timestamp | (encoded << 48) | (int(queued) << 52)
     return raw.to_bytes(7, "little")
+
+
+def _packed_bits(*fields: tuple[int, int]) -> bytes:
+    value = 0
+    position = 0
+    for item, width in fields:
+        value |= item << position
+        position += width
+    return value.to_bytes((position + 7) // 8, "little")
 
 
 def test_chaskey_subkeys_are_deterministic() -> None:
@@ -80,8 +90,113 @@ async def test_quick_verify_request_is_fragmented_for_default_mtu() -> None:
     assert session.state is SessionState.WAIT_QUICK_VERIFY
     assert len(writes) == 1
     assert writes[0][1] == 5
-    assert writes[0][9] == 0  # Do not negotiate the unsupported Duo extension.
+    assert writes[0][9] == 0x40
     assert struct.unpack_from("<I", writes[0], 14)[0] == 0x01020304
+
+
+def test_decode_duo_big_single_and_swipe_left() -> None:
+    payload = _packed_bits(
+        (0, 1),  # big button
+        (0, 1),  # first event counter is previous + 1
+        (0, 3),
+        (5, 8),  # timestamp delta
+        (1, 3),  # single click
+        (1, 1),
+        (1, 1),
+        (0, 2),  # recognized left swipe
+        (1, 8),
+        (254, 8),
+        (3, 8),
+    )
+
+    decoded = decode_duo_button_events(payload, (0, 0), 0, True)
+
+    assert [event.event_type for event in decoded.events] == [
+        "single",
+        "swipe_left",
+    ]
+    assert all(event.button == "big" for event in decoded.events)
+    assert all(event.gesture == "left" for event in decoded.events)
+    assert all(event.accelerometer == (1, -2, 3) for event in decoded.events)
+    assert decoded.event_counts == (1, 0)
+    assert decoded.last_timestamp == 5
+    assert decoded.needs_ack
+
+
+def test_decode_duo_small_button_hold() -> None:
+    payload = _packed_bits(
+        (1, 1),  # small button
+        (0, 1),
+        (0, 3),
+        (9, 8),
+        (7, 3),  # hold
+        (0, 1),  # next release is not a double click
+        (0, 8),
+        (64, 8),
+        (192, 8),
+    )
+
+    decoded = decode_duo_button_events(payload, (12, 20), 100, True)
+
+    assert [event.event_type for event in decoded.events] == ["small_hold"]
+    assert decoded.events[0].button == "small"
+    assert decoded.events[0].accelerometer == (0, 64, -64)
+    assert decoded.event_counts == (12, 21)
+    assert decoded.last_timestamp == 109
+    assert not decoded.needs_ack
+
+
+def test_decode_multiple_duo_updates_from_one_packet() -> None:
+    payload = _packed_bits(
+        (0, 1),
+        (0, 1),
+        (0, 3),
+        (2, 8),
+        (5, 3),  # big button down
+        (0, 8),
+        (0, 8),
+        (64, 8),
+        (0, 1),
+        (0, 3),
+        (6, 8),
+        (6, 3),  # single-click timeout for the same button
+        (0, 1),  # no gesture
+        (0, 8),
+        (0, 8),
+        (64, 8),
+    )
+
+    decoded = decode_duo_button_events(payload, (0, 0), 0, True)
+
+    assert [event.event_type for event in decoded.events] == ["single"]
+    assert decoded.event_counts == (2, 0)
+    assert decoded.last_timestamp == 8
+    assert decoded.needs_ack
+
+
+@pytest.mark.asyncio
+async def test_duo_init_contains_both_event_counters() -> None:
+    writes: list[bytes] = []
+
+    async def send(value: bytes) -> None:
+        writes.append(value)
+
+    session = Flic2Session(
+        "01:02:03:04:05:06",
+        send,
+        pairing=PairingData(1, bytes(range(16))),
+        event_count=12,
+        event_count_small=34,
+        boot_id=56,
+        mtu=100,
+    )
+    session._is_duo = True
+    session._session_key = bytes(range(16))
+
+    await session._send_init(full_pairing=False)
+
+    assert writes[0][1] == 35
+    assert struct.unpack_from("<III", writes[0], 2) == (12, 34, 56)
 
 
 @pytest.mark.asyncio

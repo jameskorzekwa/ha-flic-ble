@@ -47,6 +47,11 @@ OP_PING_REQUEST = 15
 OP_ACK_BUTTON_EVENTS = 16
 OP_GET_BATTERY_LEVEL_RESPONSE = 20
 OP_INIT_BUTTON_EVENTS_LIGHT = 23
+OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID = 30
+OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID = 31
+OP_BUTTON_EVENT_DUO_NOTIFICATION = 32
+OP_INIT_BUTTON_EVENTS_DUO_LIGHT = 35
+OP_ACK_BUTTON_EVENTS_DUO = 36
 
 _MASK32 = 0xFFFFFFFF
 
@@ -122,6 +127,9 @@ class ButtonEvent:
     event_count: int
     queued: bool
     timestamp_ms: int
+    button: str = "big"
+    gesture: str | None = None
+    accelerometer: tuple[int, int, int] | None = None
 
 
 @dataclass(slots=True)
@@ -131,8 +139,163 @@ class SessionResult:
     pairing: PairingData | None = None
     info: ButtonInfo | None = None
     event_count: int = 0
+    event_count_small: int = 0
     boot_id: int = 0
     battery_voltage: float | None = None
+    is_duo: bool = False
+
+
+@dataclass(slots=True)
+class DuoDecodeResult:
+    """State and user events decoded from one Duo notification."""
+
+    events: list[ButtonEvent]
+    event_counts: tuple[int, int]
+    last_timestamp: int
+    end_of_queue: bool
+    needs_ack: bool
+
+
+class _BitReader:
+    """Read the Duo's little-endian packed bitstream."""
+
+    def __init__(self, data: bytes) -> None:
+        self._value = int.from_bytes(data, "little")
+        self._size = len(data) * 8
+        self._position = 0
+
+    @property
+    def remaining(self) -> int:
+        return self._size - self._position
+
+    def read(self, width: int) -> int:
+        if width < 0 or self._position + width > self._size:
+            raise Flic2ProtocolError("Truncated Flic Duo event bitstream")
+        value = (self._value >> self._position) & ((1 << width) - 1)
+        self._position += width
+        return value
+
+
+def _signed_byte(value: int) -> int:
+    return value - 256 if value >= 128 else value
+
+
+def _duo_event_type(button_number: int, event_type: str) -> str:
+    return f"small_{event_type}" if button_number else event_type
+
+
+def decode_duo_button_events(
+    payload: bytes,
+    event_counts: tuple[int, int],
+    last_timestamp: int,
+    end_of_queue: bool,
+) -> DuoDecodeResult:
+    """Decode Flic Duo button and swipe updates."""
+    reader = _BitReader(payload)
+    counts = [event_counts[0], event_counts[1]]
+    got_event_count = [False, False]
+    events: list[ButtonEvent] = []
+    needs_ack = False
+
+    while reader.remaining > 8:
+        button_number = reader.read(1)
+        if not got_event_count[button_number]:
+            event_count_delta = reader.read(1)
+            if event_count_delta == 1 and reader.read(1):
+                width = (2, 4, 8, 32)[reader.read(2)]
+                event_count_delta = reader.read(width)
+            counts[button_number] += event_count_delta + 1
+            got_event_count[button_number] = True
+        else:
+            counts[button_number] += 1
+
+        timestamp_width = (8, 10, 13, 16, 24, 32, 40, 48)[reader.read(3)]
+        last_timestamp += reader.read(timestamp_width)
+
+        queued = False
+        if not end_of_queue:
+            if reader.read(1) == 0:
+                queued = True
+            else:
+                end_of_queue = True
+                queued = reader.read(1) == 0
+
+        event_code = reader.read(3)
+        double_click_was_hold = False
+        next_up_will_be_double = False
+        if event_code == 4:
+            double_click_was_hold = bool(reader.read(1))
+        elif event_code == 7:
+            next_up_will_be_double = bool(reader.read(1))
+
+        gesture: str | None = None
+        if event_code <= 4 or event_code == 6:
+            if reader.read(1):
+                if reader.read(1):
+                    gesture = ("left", "right", "up", "down")[reader.read(2)]
+                else:
+                    gesture = "unrecognized"
+
+        acceleration = tuple(_signed_byte(reader.read(8)) for _ in range(3))
+
+        if event_code <= 5 and counts[button_number] % 2 == 0:
+            counts[button_number] += 1
+
+        event_count = counts[button_number]
+        button = "small" if button_number else "big"
+        event_type: str | None = None
+        if event_code <= 4:
+            was_hold = event_code == 2 or (
+                event_code == 4 and double_click_was_hold
+            )
+            single_click = event_code in (1, 2)
+            double_click = event_code in (3, 4)
+            if single_click:
+                event_type = "single"
+            elif double_click:
+                event_type = "double"
+            if single_click or double_click:
+                needs_ack = True
+            if was_hold and not double_click:
+                event_type = None
+        elif event_code == 6:
+            event_type = "single"
+            needs_ack = True
+        elif event_code == 7 and not next_up_will_be_double:
+            event_type = "hold"
+
+        if event_type:
+            events.append(
+                ButtonEvent(
+                    _duo_event_type(button_number, event_type),
+                    event_count,
+                    queued,
+                    last_timestamp,
+                    button,
+                    gesture,
+                    acceleration,
+                )
+            )
+        if gesture in ("left", "right", "up", "down"):
+            events.append(
+                ButtonEvent(
+                    _duo_event_type(button_number, f"swipe_{gesture}"),
+                    event_count,
+                    queued,
+                    last_timestamp,
+                    button,
+                    gesture,
+                    acceleration,
+                )
+            )
+
+    return DuoDecodeResult(
+        events,
+        (counts[0], counts[1]),
+        last_timestamp,
+        end_of_queue,
+        needs_ack,
+    )
 
 
 def _rol32(value: int, bits: int) -> int:
@@ -298,6 +461,7 @@ class Flic2Session:
         *,
         pairing: PairingData | None = None,
         event_count: int = 0,
+        event_count_small: int = 0,
         boot_id: int = 0,
         event_callback: Callable[[ButtonEvent], None] | None = None,
         state_callback: Callable[[SessionResult], None] | None = None,
@@ -311,7 +475,10 @@ class Flic2Session:
         self._mtu = max(23, mtu)
         self._auto_disconnect_time = min(max(auto_disconnect_time, 40), 511)
         self.result = SessionResult(
-            pairing=pairing, event_count=event_count, boot_id=boot_id
+            pairing=pairing,
+            event_count=event_count,
+            event_count_small=event_count_small,
+            boot_id=boot_id,
         )
         self.state = SessionState.IDLE
         self.ready = asyncio.Event()
@@ -327,10 +494,10 @@ class Flic2Session:
         self._pending_fragment = bytearray()
         self._private_key: X25519PrivateKey | None = None
         self._client_random = b""
-        # Keep Duo-capable buttons in the backwards-compatible base Flic 2
-        # protocol. The Duo extension uses different init/event packets that
-        # this integration does not implement.
-        self._supports_duo_flag = 0x00
+        self._supports_duo_flag = 0x80
+        self._is_duo = False
+        self._duo_last_timestamp = 0
+        self._duo_end_of_queue = False
 
     async def start(self) -> None:
         """Start full pairing or quick verification."""
@@ -344,7 +511,7 @@ class Flic2Session:
             return
         self.state = SessionState.WAIT_QUICK_VERIFY
         self._qv_random = os.urandom(7)
-        flags = 0x00  # base Flic 2 protocol; signature/encryption variant 0
+        flags = 0x40  # Duo support; signature/encryption variant 0
         packet = (
             bytes([OP_QUICK_VERIFY_REQUEST])
             + self._qv_random
@@ -572,6 +739,8 @@ class Flic2Session:
             battery * 3.6 / 1024.0,
             bool(flags & 0x04),
         )
+        self._is_duo = self.result.info.is_duo
+        self.result.is_duo = self._is_duo
         self.result.battery_voltage = self.result.info.battery_voltage
         self.state = SessionState.ESTABLISHED
         self.pairing_complete.set()
@@ -587,11 +756,13 @@ class Flic2Session:
         tmp_id = struct.unpack_from("<I", data, 8)[0]
         if tmp_id != self._tmp_id:
             return
-        flags = 0x00
+        flags = 0x40
         quick_message = self._qv_random + bytes([flags]) + button_random
         self._session_key = chaskey_16(self.result.pairing.key, quick_message)
         self._conn_id = conn_id
         self._verify_signed(packet)
+        self._is_duo = bool(data[12] & 0x04)
+        self.result.is_duo = self._is_duo
         self.state = SessionState.ESTABLISHED
         await self._send_init(full_pairing=False)
 
@@ -601,11 +772,23 @@ class Flic2Session:
             | ((0 if full_pairing else 31) << 9)
             | (0xFFFFF << 14)
         )
-        packet = (
-            bytes([OP_INIT_BUTTON_EVENTS_LIGHT])
-            + struct.pack("<II", self.result.event_count, self.result.boot_id)
-            + options.to_bytes(5, "little")
-        )
+        if self._is_duo:
+            packet = (
+                bytes([OP_INIT_BUTTON_EVENTS_DUO_LIGHT])
+                + struct.pack(
+                    "<III",
+                    self.result.event_count,
+                    self.result.event_count_small,
+                    self.result.boot_id,
+                )
+                + options.to_bytes(5, "little")
+            )
+        else:
+            packet = (
+                bytes([OP_INIT_BUTTON_EVENTS_LIGHT])
+                + struct.pack("<II", self.result.event_count, self.result.boot_id)
+                + options.to_bytes(5, "little")
+            )
         await self._send_signed(packet)
 
     async def _handle_established(self, packet: bytes) -> None:
@@ -628,6 +811,25 @@ class Flic2Session:
             self._notify_state()
             if not has_queued:
                 return
+        elif opcode in (
+            OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID,
+            OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
+        ):
+            if len(data) < 14:
+                raise Flic2ProtocolError("Malformed Flic Duo init response")
+            packed_time = int.from_bytes(data[:6], "little")
+            has_queued = bool(packed_time & 1)
+            self.result.event_count, self.result.event_count_small = (
+                struct.unpack_from("<II", data, 6)
+            )
+            if opcode == OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID:
+                if len(data) < 18:
+                    raise Flic2ProtocolError("Duo init response omitted its boot id")
+                self.result.boot_id = struct.unpack_from("<I", data, 14)[0]
+            self._duo_last_timestamp = 0
+            self._duo_end_of_queue = not has_queued
+            self.ready.set()
+            self._notify_state()
         elif opcode == OP_BUTTON_EVENT_NOTIFICATION:
             if len(data) < 11:
                 return
@@ -641,6 +843,27 @@ class Flic2Session:
             if button_events_need_ack(data[4:]):
                 await self._send_signed(
                     bytes([OP_ACK_BUTTON_EVENTS]) + struct.pack("<I", event_count)
+                )
+        elif opcode == OP_BUTTON_EVENT_DUO_NOTIFICATION:
+            decoded = decode_duo_button_events(
+                data,
+                (self.result.event_count, self.result.event_count_small),
+                self._duo_last_timestamp,
+                self._duo_end_of_queue,
+            )
+            self.result.event_count, self.result.event_count_small = (
+                decoded.event_counts
+            )
+            self._duo_last_timestamp = decoded.last_timestamp
+            self._duo_end_of_queue = decoded.end_of_queue
+            self._notify_state()
+            for event in decoded.events:
+                if self._event_callback:
+                    self._event_callback(event)
+            if decoded.needs_ack:
+                await self._send_signed(
+                    bytes([OP_ACK_BUTTON_EVENTS_DUO])
+                    + struct.pack("<II", *decoded.event_counts)
                 )
         elif opcode == OP_PING_REQUEST:
             await self._send_signed(bytes([OP_PING_RESPONSE]))
