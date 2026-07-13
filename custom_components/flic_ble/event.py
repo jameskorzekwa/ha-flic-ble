@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from homeassistant.components.event import EventEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_DEVICE_ID, CONF_TYPE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import EVENT_TYPES
+from .const import EVENT_FLIC_EVENT, EVENT_TYPES
 from .entity import FlicEntity
 from .protocol import ButtonEvent
 
@@ -61,3 +62,17 @@ class FlicEventEntity(FlicEntity, EventEntity):
             event_data,
         )
         self.async_write_ha_state()
+        # Also fire an HA bus event so automations can use event/device triggers
+        # rather than a state trigger on this entity. Bus events have no state and
+        # cannot be "unavailable", so a press queued while the button slept and
+        # delivered on reconnect fires reliably instead of being filtered out.
+        device_id = self.registry_entry.device_id if self.registry_entry else None
+        if device_id is not None:
+            self.hass.bus.async_fire(
+                EVENT_FLIC_EVENT,
+                {
+                    CONF_DEVICE_ID: device_id,
+                    CONF_TYPE: event.event_type,
+                    **event_data,
+                },
+            )

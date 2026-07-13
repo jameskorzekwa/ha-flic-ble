@@ -5,6 +5,15 @@ from homeassistant.const import Platform
 DOMAIN = "flic_ble"
 PLATFORMS = [Platform.EVENT, Platform.SENSOR]
 
+# Home Assistant bus event fired for every button press. Automations and device
+# triggers listen for this instead of watching the event entity's state, so a
+# press queued while the button slept and delivered on reconnect is never lost
+# to an entity "unavailable" transition.
+EVENT_FLIC_EVENT = f"{DOMAIN}_event"
+ATTR_TYPE = "type"
+ATTR_BUTTON = "button"
+ATTR_GESTURE = "gesture"
+
 SERVICE_UUID = "00420000-8f59-4420-870d-84f3b617e493"
 TX_UUID = "00420001-8f59-4420-870d-84f3b617e493"
 RX_UUID = "00420002-8f59-4420-870d-84f3b617e493"

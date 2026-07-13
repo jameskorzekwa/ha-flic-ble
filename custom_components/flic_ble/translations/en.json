@@ -29,6 +29,24 @@
       "not_supported": "This Bluetooth device is not a supported Flic button. Flic v1 buttons are not supported."
     }
   },
+  "device_automation": {
+    "trigger_type": {
+      "single": "Pressed",
+      "double": "Double pressed",
+      "hold": "Held",
+      "swipe_left": "Swiped left",
+      "swipe_right": "Swiped right",
+      "swipe_up": "Swiped up",
+      "swipe_down": "Swiped down",
+      "small_single": "Small button pressed",
+      "small_double": "Small button double pressed",
+      "small_hold": "Small button held",
+      "small_swipe_left": "Small button swiped left",
+      "small_swipe_right": "Small button swiped right",
+      "small_swipe_up": "Small button swiped up",
+      "small_swipe_down": "Small button swiped down"
+    }
+  },
   "entity": {
     "event": {"button": {"name": "Button"}},
     "sensor": {"battery_voltage": {"name": "Battery voltage"}}
