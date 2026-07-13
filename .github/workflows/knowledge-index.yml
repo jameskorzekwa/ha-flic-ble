@@ -1,0 +1,65 @@
+name: Knowledge index
+
+# Runs AFTER a PR is merged into main — separate from the release pipeline, so it
+# never blocks a release. Uses Claude (via a Claude subscription OAuth token, not
+# an API key) to UPDATE the AGENTS.md knowledge base for just what the PR changed.
+#
+# Loop-safety: this triggers on `pull_request: closed`, and the doc update is a
+# direct push to main (not a PR), so it can't re-trigger itself. Release/test
+# workflows in these repos already `paths-ignore: AGENTS.md`, so the doc commit
+# won't kick off a build either.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:   # manual "Run" for testing
+
+jobs:
+  update-index:
+    # only for PRs that were actually MERGED (not just closed), or manual runs
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # commit the refreshed AGENTS.md to main
+      pull-requests: write   # claude-code-action GitHub integration
+      id-token: write        # claude-code-action mints its GitHub App token via OIDC
+    steps:
+      - name: Ensure Claude token is configured
+        id: guard
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN secret not set — skipping. Create one locally with 'claude setup-token' (uses your Claude subscription), then add it: gh secret set CLAUDE_CODE_OAUTH_TOKEN -R ${{ github.repository }}"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.guard.outputs.ok == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0     # full history so Claude can diff the merged PR
+
+      - name: Update AGENTS.md with Claude
+        if: steps.guard.outputs.ok == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use the built-in workflow token for git/GitHub ops, so the Claude
+          # Code GitHub App does NOT need to be installed on the repo.
+          github_token: ${{ github.token }}
+          # Use a strong model — quality over speed. Pin a different one here if desired.
+          claude_args: "--model claude-opus-4-8 --max-turns 30"
+          prompt: |
+            Pull request #${{ github.event.pull_request.number || 'N/A' }} ("${{ github.event.pull_request.title || 'manual run' }}") was merged into `main`.
+            Update this repository's AGENTS.md knowledge base so it stays accurate for the code that changed — do NOT rewrite it from scratch.
+
+            1. Find what changed. For a merged PR, diff its base against main:
+               `git diff --stat ${{ github.event.pull_request.base.sha || 'HEAD~1' }}..HEAD`
+               then read the changed source files. (For a manual run, review recent commits.)
+            2. AGENTS.md — and any subdirectory AGENTS.md files — are a TELEGRAPHIC, dense knowledge base for AI coding agents. Sections (only those that apply): one-line OVERVIEW; STRUCTURE (tree, comment only non-obvious entries); WHERE TO LOOK (task → location table); CODE MAP (key modules/classes + role); CONVENTIONS (project-specific deviations only); ANTI-PATTERNS / gotchas specific to THIS project; COMMANDS; NOTES. Only non-obvious, project-specific info — no generic advice.
+            3. Make ONLY the edits the code changes require; preserve all other content verbatim. Update the relevant subdirectory AGENTS.md if the change touches its area. If no AGENTS.md exists yet, generate a root one (plus complexity-scored subdirectory files only where a directory is a genuinely distinct, complex domain).
+            4. Do NOT modify anything under `.github/`.
+            5. When done, commit ONLY the AGENTS.md file(s) to `main` and push, with a message like `docs: update AGENTS.md for #${{ github.event.pull_request.number || 'manual' }}`. If pushing directly to `main` isn't possible, open a pull request with the change instead. If nothing needs changing, make no commit.
