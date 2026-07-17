@@ -2,16 +2,22 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main
+    paths-ignore:
+      - 'AGENTS.md'
+      - '**/AGENTS.md'
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build HACS release
+  test:
+    name: Ruff and pytest
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -29,32 +35,91 @@ jobs:
       - name: Run Ruff
         run: ruff check .
 
+      - name: Check Ruff formatting
+        run: ruff format --check .
+
       - name: Run tests
         run: pytest -q
 
-      - name: Verify tag matches manifest version
-        if: github.ref_type == 'tag'
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate HACS repository
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    name: Hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Validate Home Assistant integration
+        uses: home-assistant/actions/hassfest@master
+
+  release:
+    name: Build HACS release
+    needs:
+      - test
+      - hacs
+      - hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select release version
+        id: version
         shell: bash
         run: |
           version="$(jq -r '.version' custom_components/flic_ble/manifest.json)"
-          test "${GITHUB_REF_NAME}" = "v${version}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Manifest version is not a semantic version: ${version}" >&2
+            exit 1
+          fi
+
+          bumped=false
+          if git rev-parse --quiet --verify "refs/tags/v${version}" >/dev/null; then
+            IFS=. read -r major minor patch <<<"${version}"
+            version="${major}.${minor}.$((patch + 1))"
+            jq --arg version "${version}" \
+              '.version = $version' \
+              custom_components/flic_ble/manifest.json > manifest.json.tmp
+            mv manifest.json.tmp custom_components/flic_ble/manifest.json
+            bumped=true
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+          echo "bumped=${bumped}" >> "${GITHUB_OUTPUT}"
 
       - name: Build integration archive
         run: bash .github/scripts/build_release.sh
 
-      - name: Publish GitHub release
-        if: github.ref_type == 'tag'
+      - name: Commit version bump
+        if: steps.version.outputs.bumped == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" flic_ble.zip \
-            --generate-notes \
-            --title "Flic Bluetooth ${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add custom_components/flic_ble/manifest.json
+          git commit -m "chore: bump version to ${VERSION}"
+          git push origin HEAD:main
 
-      - name: Upload workflow artifact
-        if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
-        with:
-          name: flic_ble
-          path: flic_ble.zip
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          git tag --annotate "${TAG}" --message "Flic Bluetooth ${TAG}"
+          git push origin "${TAG}"
+          gh release create "${TAG}" flic_ble.zip \
+            --generate-notes \
+            --title "Flic Bluetooth ${TAG}"
