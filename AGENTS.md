@@ -60,7 +60,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 ## ANTI-PATTERNS / GOTCHAS (THIS PROJECT)
 - DO NOT drive automations off the event *entity's* state — use the `flic_ble_event` bus event / device triggers. A press queued while the button slept is delivered on reconnect; entity state was "unavailable" then, so a state trigger would drop it. (see `const.py` and `event.py` comments)
 - Plain button up/down does NOT emit a user event — Flic follows it with a single-click-timeout packet; wait for that (`decode_button_events`). Emitting on up creates duplicate clicks.
-- A recognized swipe suppresses its underlying physical click; swipe emitted only from the release packet to avoid duplicate/repeat on the single-click timeout (`decode_duo_button_events`).
+- A recognized swipe suppresses its underlying single click, but never a double click; swipe emitted only from the release packet to avoid duplicate/repeat on the single-click timeout (`decode_duo_button_events`).
 - Duo bitstream: stop while `unread_bytes > 1` — trailing bits + final byte are padding, not another update.
 - Signed packets use separate rx/tx counters; reordering or replaying breaks the MAC (`AuthenticationError`).
 - Flic v1 buttons unsupported (different undocumented protocol). Supported names start `F2`.
