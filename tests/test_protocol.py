@@ -132,6 +132,33 @@ def test_decode_duo_big_single_and_swipe_left() -> None:
     assert decoded.needs_ack
 
 
+def test_duo_double_click_with_gesture_stays_double_click() -> None:
+    payload = _packed_bits(
+        (0, 1),  # big button
+        (1, 1),
+        (1, 1),
+        (1, 2),  # four-bit event counter delta
+        (7, 4),  # eight raw events for a physical double click
+        (0, 3),
+        (5, 8),  # timestamp delta
+        (3, 3),  # double click
+        (1, 1),  # motion detected
+        (1, 1),  # recognized gesture
+        (3, 2),  # down
+        (247, 8),
+        (3, 8),
+        (89, 8),
+    )
+
+    decoded = decode_duo_button_events(payload, (100, 0), 0, True)
+
+    assert [event.event_type for event in decoded.events] == ["double"]
+    assert decoded.events[0].gesture == "down"
+    assert decoded.events[0].accelerometer == (-9, 3, 89)
+    assert decoded.event_counts == (109, 0)
+    assert decoded.needs_ack
+
+
 def test_duo_decoder_ignores_final_padding_byte() -> None:
     payload = (
         _packed_bits(
