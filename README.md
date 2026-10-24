@@ -55,7 +55,9 @@ configuration are not currently supported.
 ## Installation with HACS
 
 This integration is intended to be installed from a tagged GitHub release
-through HACS.
+through HACS. HACS copies `custom_components/flic_ble/` from the release tag;
+the repository does not use `zip_release`, because GitHub's release-asset
+redirect sends a header larger than Home Assistant's HTTP client accepts.
 
 Until it is included in the default HACS repository list:
 

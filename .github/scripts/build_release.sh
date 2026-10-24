@@ -9,7 +9,6 @@ rm -f flic_ble.zip
   zip -r ../../flic_ble.zip . -x '*__pycache__*' '*.pyc'
 )
 
-zip -j flic_ble.zip FLIC_LICENSE.txt NOTICE
 
 archive_contents="$(unzip -Z1 flic_ble.zip)"
 grep -qx "manifest.json" <<<"${archive_contents}"

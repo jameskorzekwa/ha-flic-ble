@@ -72,6 +72,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Configure git identity
+        # Needed by both the version-bump commit and the annotated release tag.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Select release version
         id: version
         shell: bash
@@ -106,8 +112,6 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add custom_components/flic_ble/manifest.json
           git commit -m "chore: bump version to ${VERSION}"
           git push origin HEAD:main
