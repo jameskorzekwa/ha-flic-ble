@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from bleak.exc import BleakCharacteristicNotFoundError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
@@ -38,6 +39,69 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _CONNECT_ATTEMPT_TIMEOUT_SECONDS = 75
 _INFINITE_AUTO_DISCONNECT_TIME = 511
+
+
+def _has_flic_characteristics(client: Any) -> bool:
+    """Return whether the client's resolved GATT table has both Flic UUIDs."""
+    try:
+        services = client.services
+        return all(
+            services.get_characteristic(uuid) is not None for uuid in (TX_UUID, RX_UUID)
+        )
+    except Exception:  # an unresolved GATT table counts as missing
+        return False
+
+
+async def _async_open_flic_client(
+    ble_device: BLEDevice,
+    name: str,
+    latest_device: Callable[[], BLEDevice],
+    disconnected_callback: Callable[[Any], None] | None = None,
+) -> BleakClientWithServiceCache:
+    """Connect and return a client whose GATT table has the Flic characteristics.
+
+    BlueZ can hand back a cached or partially discovered GATT table (seen on a
+    Raspberry Pi's onboard adapter after a Home Assistant restart), which makes
+    ``start_notify`` fail with "Characteristic 00420002-… was not found". When
+    that happens, clear the cache, reconnect with fresh service discovery, and
+    try once more before giving up.
+    """
+    kwargs: dict[str, Any] = {
+        "max_attempts": 3,
+        "ble_device_callback": latest_device,
+    }
+    if disconnected_callback is not None:
+        kwargs["disconnected_callback"] = disconnected_callback
+    client = await establish_connection(
+        BleakClientWithServiceCache,
+        ble_device,
+        name,
+        use_services_cache=True,
+        **kwargs,
+    )
+    if _has_flic_characteristics(client):
+        return client
+    _LOGGER.warning(
+        "Flic %s GATT table is missing the Flic characteristics; clearing the "
+        "Bluetooth cache and retrying with fresh service discovery",
+        ble_device.address,
+    )
+    with contextlib.suppress(Exception):
+        await client.clear_cache()
+    with contextlib.suppress(Exception):
+        await client.disconnect()
+    client = await establish_connection(
+        BleakClientWithServiceCache,
+        latest_device(),
+        name,
+        use_services_cache=False,
+        **kwargs,
+    )
+    if _has_flic_characteristics(client):
+        return client
+    with contextlib.suppress(Exception):
+        await client.disconnect()
+    raise BleakCharacteristicNotFoundError(RX_UUID)
 
 
 class FlicDevice:
@@ -177,14 +241,8 @@ class FlicDevice:
         disconnected_callback: Callable[[Any], None],
     ) -> None:
         """Establish and authenticate one bounded Flic BLE session."""
-        client = await establish_connection(
-            BleakClientWithServiceCache,
-            ble_device,
-            self.name,
-            disconnected_callback=disconnected_callback,
-            max_attempts=3,
-            ble_device_callback=latest_device,
-            use_services_cache=True,
+        client = await _async_open_flic_client(
+            ble_device, self.name, latest_device, disconnected_callback
         )
         self._client = client
 
@@ -300,13 +358,8 @@ async def async_pair_device(
             or service_info.device
         )
 
-    client = await establish_connection(
-        BleakClientWithServiceCache,
-        service_info.device,
-        service_info.name,
-        max_attempts=3,
-        ble_device_callback=_latest_device,
-        use_services_cache=True,
+    client = await _async_open_flic_client(
+        service_info.device, service_info.name, _latest_device
     )
     try:
 
