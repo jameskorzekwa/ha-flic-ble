@@ -18,6 +18,7 @@ from .const import (
     CONF_BOOT_ID,
     CONF_EVENT_COUNT,
     CONF_EVENT_COUNT_SMALL,
+    CONF_FIRMWARE_VERSION,
     CONF_IS_DUO,
     CONF_PAIRING_IDENTIFIER,
     CONF_PAIRING_KEY,
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _CONNECT_ATTEMPT_TIMEOUT_SECONDS = 75
 _INFINITE_AUTO_DISCONNECT_TIME = 511
+# The protocol specification asks for a five second pause before starting a
+# new session after one failed (for example on a bad packet signature).
+_SESSION_FAILURE_BACKOFF_SECONDS = 5.0
 
 
 def _has_flic_characteristics(client: Any) -> bool:
@@ -113,6 +117,7 @@ class FlicDevice:
         self.address: str = entry.data["address"].upper()
         self.name = entry.title
         self.available = False
+        self.readvertise_configured = False
         self.battery_voltage: float | None = entry.data.get("battery_voltage")
         self._client: BleakClientWithServiceCache | None = None
         self._connect_lock = asyncio.Lock()
@@ -122,6 +127,7 @@ class FlicDevice:
         self._event_listeners: set[Callable[[ButtonEvent], None]] = set()
         self._state_listeners: set[Callable[[], None]] = set()
         self._stopping = False
+        self._retry_not_before = 0.0
 
     async def async_start(self) -> None:
         """Start listening for advertisements and connect when reachable."""
@@ -203,6 +209,11 @@ class FlicDevice:
             )
             if not ble_device:
                 return
+            delay = self._retry_not_before - asyncio.get_running_loop().time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+                if self._stopping:
+                    return
 
             def _latest_device() -> BLEDevice:
                 return (
@@ -260,10 +271,12 @@ class FlicDevice:
             event_count=self.entry.data.get(CONF_EVENT_COUNT, 0),
             event_count_small=self.entry.data.get(CONF_EVENT_COUNT_SMALL, 0),
             boot_id=self.entry.data.get(CONF_BOOT_ID, 0),
+            firmware_version=self.entry.data.get(CONF_FIRMWARE_VERSION),
             event_callback=self._handle_event,
             state_callback=self._handle_state,
             mtu=getattr(client, "mtu_size", 23),
             auto_disconnect_time=_INFINITE_AUTO_DISCONNECT_TIME,
+            readvertise_after_loss=True,
         )
         notification_lock = asyncio.Lock()
 
@@ -273,6 +286,9 @@ class FlicDevice:
                     await session.feed_gatt(data)
             except Exception as err:
                 _LOGGER.warning("Flic session failed for %s: %s", self.address, err)
+                self._retry_not_before = (
+                    asyncio.get_running_loop().time() + _SESSION_FAILURE_BACKOFF_SECONDS
+                )
                 if self._client is client:
                     with contextlib.suppress(Exception):
                         await client.disconnect()
@@ -297,6 +313,11 @@ class FlicDevice:
     @callback
     def _handle_state(self, result: SessionResult) -> None:
         self.battery_voltage = result.battery_voltage or self.battery_voltage
+        if result.adv_parameters_set and not self.readvertise_configured:
+            _LOGGER.debug(
+                "Flic %s will keep advertising after a lost connection", self.address
+            )
+        self.readvertise_configured = result.adv_parameters_set
         data = {
             **self.entry.data,
             CONF_EVENT_COUNT: result.event_count,
@@ -304,6 +325,8 @@ class FlicDevice:
             CONF_BOOT_ID: result.boot_id,
             CONF_IS_DUO: result.is_duo,
         }
+        if result.firmware_version is not None:
+            data[CONF_FIRMWARE_VERSION] = result.firmware_version
         if self.battery_voltage is not None:
             data["battery_voltage"] = self.battery_voltage
         if data != self.entry.data:
