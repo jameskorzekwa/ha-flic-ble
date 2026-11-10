@@ -45,9 +45,11 @@ hardware for years, but older round buttons may still be v1.
 - Local operation without a Flic Hub or cloud service
 - ESPHome Bluetooth proxy routing and failover
 - Persistent BLE sessions for reliable, low-latency events
-- Automatic reconnection after a lost link: buttons are told to keep
-  advertising for a day after a dropped connection (for example a Bluetooth
-  proxy restart) instead of waiting silently for the next press
+- Automatic reconnection: buttons are told to keep advertising for a day
+  after a lost link (for example a Bluetooth proxy reboot), are released so
+  they keep advertising when Home Assistant restarts or the entry reloads,
+  and every advertisement retries the connection, so a press is not lost
+  when one connection attempt fails
 - Battery voltage reporting
 - Swipe recognition without duplicate click events
 - Hold recognition without a duplicate click on release

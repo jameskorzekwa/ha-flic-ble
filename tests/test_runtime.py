@@ -9,11 +9,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from custom_components.flic_ble import runtime
-from custom_components.flic_ble.protocol import PairingError
+from custom_components.flic_ble.protocol import PairingError, SessionState
 
 
 class _FakeHass:
-    def async_create_task(self, coro):
+    def async_create_task(self, coro, name=None, eager_start=True):
         return asyncio.create_task(coro)
 
 
@@ -270,3 +270,167 @@ def test_firmware_version_is_persisted_from_session_state() -> None:
 
     assert updates[-1]["firmware_version"] == 11
     assert device.readvertise_configured
+
+
+def _established(device: runtime.FlicDevice, *, closes_link: bool):
+    client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+    device._client = client
+    device.available = True
+
+    async def _request_disconnect(*, restart_advertising: bool) -> None:
+        assert restart_advertising
+        if closes_link:
+            # The button drops the link; the disconnected callback fires.
+            device._client = None
+            device._session = None
+            device.available = False
+            device._link_closed.set()
+
+    session = SimpleNamespace(
+        state=SessionState.ESTABLISHED,
+        request_disconnect=AsyncMock(side_effect=_request_disconnect),
+    )
+    device._session = session
+    return client, session
+
+
+@pytest.mark.asyncio
+async def test_stop_lets_the_button_close_the_link() -> None:
+    device = _device()
+    client, session = _established(device, closes_link=True)
+
+    await device.async_stop()
+
+    session.request_disconnect.assert_awaited_once_with(restart_advertising=True)
+    client.disconnect.assert_not_awaited()
+    assert device._client is None
+    assert device._session is None
+
+
+@pytest.mark.asyncio
+async def test_stop_falls_back_to_host_disconnect(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_RELEASE_TIMEOUT_SECONDS", 0.05)
+    device = _device()
+    client, session = _established(device, closes_link=False)
+
+    await device.async_stop()
+
+    session.request_disconnect.assert_awaited_once()
+    client.disconnect.assert_awaited_once_with()
+    assert device._client is None
+
+
+@pytest.mark.asyncio
+async def test_stop_without_session_only_disconnects() -> None:
+    device = _device()
+    client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+    device._client = client
+
+    await device.async_stop()
+
+    client.disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_start_releases_button_when_home_assistant_stops(monkeypatch) -> None:
+    device = _device()
+    listeners: dict[str, object] = {}
+    unloads: list[object] = []
+    device.hass.bus = SimpleNamespace(
+        async_listen_once=lambda event, action: (
+            listeners.__setitem__(event, action) or (lambda: None)
+        )
+    )
+    device.entry.async_on_unload = unloads.append
+    monkeypatch.setattr(
+        runtime.bluetooth, "async_register_callback", lambda *a, **k: lambda: None
+    )
+    monkeypatch.setattr(
+        runtime.bluetooth, "async_ble_device_from_address", lambda *a, **k: None
+    )
+    stop = AsyncMock()
+    monkeypatch.setattr(device, "async_stop", stop)
+
+    await device.async_start()
+    await listeners[runtime.EVENT_HOMEASSISTANT_STOP](object())
+
+    stop.assert_awaited_once()
+    assert len(unloads) == 2
+
+
+def _advert(*, public: bool) -> SimpleNamespace:
+    if public:
+        return SimpleNamespace(name="F211abcd", service_uuids=[runtime.SERVICE_UUID])
+    return SimpleNamespace(name="01:02:03:04:05:06", service_uuids=[])
+
+
+@pytest.mark.asyncio
+async def test_private_mode_advertisement_marks_connection_stale(monkeypatch) -> None:
+    device = _device()
+    device._client = SimpleNamespace(is_connected=True)
+    device.available = True
+    device._available_since = asyncio.get_running_loop().time() - 10
+    scheduled: list[bool] = []
+    monkeypatch.setattr(
+        device,
+        "_schedule_connect",
+        lambda *, force_reconnect=False: scheduled.append(force_reconnect),
+    )
+
+    device._handle_advertisement(_advert(public=False))
+    device._handle_advertisement(_advert(public=True))
+    device._available_since = asyncio.get_running_loop().time()
+    device._handle_advertisement(_advert(public=False))
+
+    # private advert, public advert, private advert just after connecting
+    assert scheduled == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_start_registers_every_advertisement_callback(monkeypatch) -> None:
+    device = _device()
+    device.hass.bus = SimpleNamespace(async_listen_once=lambda *a: lambda: None)
+    device.entry.async_on_unload = lambda _: None
+    registered: dict[str, object] = {}
+    monkeypatch.setattr(
+        runtime.bluetooth,
+        "async_register_callback",
+        lambda hass, cb, matcher, mode: (
+            registered.__setitem__("mode", mode) or (lambda: None)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime.bluetooth,
+        "async_register_advertisement_callback",
+        lambda hass, cb, address: (
+            registered.__setitem__("every", (cb, address)) or (lambda: None)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.bluetooth, "async_ble_device_from_address", lambda *a, **k: None
+    )
+
+    await device.async_start()
+
+    assert registered["mode"] is runtime.bluetooth.BluetoothScanningMode.PASSIVE
+    assert registered["every"] == (device._handle_advertisement, device.address)
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_sets_retry_backoff(monkeypatch) -> None:
+    device = _device()
+    monkeypatch.setattr(
+        runtime.bluetooth,
+        "async_ble_device_from_address",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        device, "_async_establish_session", AsyncMock(side_effect=OSError("no"))
+    )
+    loop = asyncio.get_running_loop()
+
+    await device.async_connect()
+
+    assert device._retry_not_before > loop.time()
+    assert not device.available
