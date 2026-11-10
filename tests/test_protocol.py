@@ -10,12 +10,14 @@ from custom_components.flic_ble.protocol import (
     ADV_INTERVAL_FAST,
     ADV_INTERVAL_SLOW,
     ADV_TIMEOUT_SECONDS,
+    OP_FORCE_BT_DISCONNECT,
     OP_GET_FIRMWARE_VERSION_REQUEST,
     OP_GET_FIRMWARE_VERSION_RESPONSE,
     OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
     OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
     OP_SET_ADV_PARAMETERS_REQUEST,
     OP_SET_ADV_PARAMETERS_RESPONSE,
+    FlicProtocolError,
     FlicSession,
     NoPairingSlotsError,
     PairingData,
@@ -491,3 +493,32 @@ async def test_advertising_parameters_response_is_recorded() -> None:
 
     assert session.result.adv_parameters_set
     assert results[-1].adv_parameters_set
+
+
+def test_advertising_parameters_response_opcode_matches_firmware() -> None:
+    """A firmware 17 Flic Duo answers SetAdvParametersRequest with opcode 25."""
+    assert OP_SET_ADV_PARAMETERS_RESPONSE == 25
+
+
+@pytest.mark.asyncio
+async def test_request_disconnect_asks_button_to_restart_advertising() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=11)
+
+    await session.request_disconnect(restart_advertising=True)
+
+    assert writes[0][1:-5] == bytes([OP_FORCE_BT_DISCONNECT, 1])
+    assert writes[0][-5:] == chaskey_signature(
+        _SESSION_KEY, 1, 0, bytes([OP_FORCE_BT_DISCONNECT, 1])
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_disconnect_needs_an_established_session() -> None:
+    async def send(_: bytes) -> None:
+        return None
+
+    session = FlicSession("01:02:03:04:05:06", send)
+
+    with pytest.raises(FlicProtocolError):
+        await session.request_disconnect(restart_advertising=True)

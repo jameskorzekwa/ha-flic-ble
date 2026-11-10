@@ -38,6 +38,7 @@ OP_FULL_VERIFY_FAIL_RESPONSE = 3
 OP_QUICK_VERIFY_REQUEST = 5
 OP_GET_FIRMWARE_VERSION_RESPONSE = 5
 OP_QUICK_VERIFY_NEGATIVE_RESPONSE = 6
+OP_FORCE_BT_DISCONNECT = 6
 OP_GET_FIRMWARE_VERSION_REQUEST = 8
 OP_QUICK_VERIFY_RESPONSE = 8
 OP_DISCONNECT_VERIFIED_LINK = 9
@@ -49,8 +50,10 @@ OP_PING_REQUEST = 15
 OP_ACK_BUTTON_EVENTS = 16
 OP_GET_BATTERY_LEVEL_RESPONSE = 20
 OP_INIT_BUTTON_EVENTS_LIGHT = 23
+# The published specification lists this response as 27, but Shortcut Labs'
+# reference C enum and a firmware 17 Flic Duo both use 25.
+OP_SET_ADV_PARAMETERS_RESPONSE = 25
 OP_SET_ADV_PARAMETERS_REQUEST = 27
-OP_SET_ADV_PARAMETERS_RESPONSE = 27
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID = 30
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID = 31
 OP_BUTTON_EVENT_DUO_NOTIFICATION = 32
@@ -841,6 +844,20 @@ class FlicSession:
             return
         if self.result.firmware_version >= ADV_PARAMETERS_MIN_FIRMWARE:
             await self._send_set_adv_parameters()
+
+    async def request_disconnect(self, *, restart_advertising: bool) -> None:
+        """Ask the button to drop the BLE link itself.
+
+        A link closed from the host side leaves a private-mode Flic silent
+        until its next press. When the button closes the link on request with
+        ``restart_advertising`` it keeps advertising, so Home Assistant can
+        reconnect automatically after a restart or reload.
+        """
+        if self.state is not SessionState.ESTABLISHED:
+            raise FlicProtocolError("No established Flic session to release")
+        await self._send_signed(
+            bytes([OP_FORCE_BT_DISCONNECT, int(restart_advertising)])
+        )
 
     async def _send_set_adv_parameters(self) -> None:
         packet = bytes([OP_SET_ADV_PARAMETERS_REQUEST]) + struct.pack(

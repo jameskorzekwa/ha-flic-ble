@@ -12,7 +12,8 @@ from bleak.exc import BleakCharacteristicNotFoundError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
 
 from .const import (
     CONF_BOOT_ID,
@@ -23,6 +24,7 @@ from .const import (
     CONF_PAIRING_IDENTIFIER,
     CONF_PAIRING_KEY,
     RX_UUID,
+    SERVICE_UUID,
     TX_UUID,
 )
 from .protocol import (
@@ -31,6 +33,7 @@ from .protocol import (
     PairingData,
     PairingTimeoutError,
     SessionResult,
+    SessionState,
 )
 
 if TYPE_CHECKING:
@@ -43,6 +46,29 @@ _INFINITE_AUTO_DISCONNECT_TIME = 511
 # The protocol specification asks for a five second pause before starting a
 # new session after one failed (for example on a bad packet signature).
 _SESSION_FAILURE_BACKOFF_SECONDS = 5.0
+# How long to wait for the button to close the link itself when asked.
+_RELEASE_TIMEOUT_SECONDS = 3.0
+# Spacing between connection attempts while a button keeps advertising.
+_CONNECT_FAILURE_BACKOFF_SECONDS = 2.0
+# Proxies batch advertisements, so ones heard just before a link came up can
+# arrive after it; do not treat those as evidence that the link is stale.
+_STALE_LINK_GRACE_SECONDS = 2.0
+
+
+def _is_public_mode_advertisement(
+    service_info: bluetooth.BluetoothServiceInfoBleak,
+) -> bool:
+    """Return whether an advertisement is the public (pairing) mode one.
+
+    A private-mode Flic advertises only flags, and only while it is not
+    connected to anything, so such an advertisement from a button we believe
+    is connected means the link is stale. A public-mode button advertises its
+    service UUID and ``F2…`` name even while connected.
+    """
+    return bool(
+        service_info.name.startswith("F2")
+        or SERVICE_UUID in {uuid.lower() for uuid in service_info.service_uuids}
+    )
 
 
 def _has_flic_characteristics(client: Any) -> bool:
@@ -120,6 +146,8 @@ class FlicDevice:
         self.readvertise_configured = False
         self.battery_voltage: float | None = entry.data.get("battery_voltage")
         self._client: BleakClientWithServiceCache | None = None
+        self._session: FlicSession | None = None
+        self._link_closed: asyncio.Event | None = None
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
         self._connect_pending = False
@@ -128,6 +156,7 @@ class FlicDevice:
         self._state_listeners: set[Callable[[], None]] = set()
         self._stopping = False
         self._retry_not_before = 0.0
+        self._available_since = 0.0
 
     async def async_start(self) -> None:
         """Start listening for advertisements and connect when reachable."""
@@ -137,27 +166,62 @@ class FlicDevice:
             service_info: bluetooth.BluetoothServiceInfoBleak,
             change: bluetooth.BluetoothChange,
         ) -> None:
-            if not self._stopping:
-                client = self._client
-                # A private-mode Flic advertises only while physically
-                # disconnected. Replace a proxy client with stale link state.
-                force_reconnect = bool(
-                    self.available and client and client.is_connected
-                )
-                self._schedule_connect(force_reconnect=force_reconnect)
+            self._handle_advertisement(service_info)
 
+        # The change-driven callback fires once per press because a private
+        # mode Flic's advertisement never changes. Private mode has an empty
+        # scan response, so passive scanning is enough.
         self.entry.async_on_unload(
             bluetooth.async_register_callback(
                 self.hass,
                 _advertisement,
                 BluetoothCallbackMatcher({ADDRESS: self.address}),
-                bluetooth.BluetoothScanningMode.ACTIVE,
+                bluetooth.BluetoothScanningMode.PASSIVE,
+            )
+        )
+        # Every-advertisement callbacks (Home Assistant 2026.11+) turn the
+        # button's advertising window into a retry loop: a press advertises
+        # for about 30 s and a lost link for a day, so one failed connection
+        # attempt no longer loses the press.
+        if register_every := getattr(
+            bluetooth, "async_register_advertisement_callback", None
+        ):
+            self.entry.async_on_unload(
+                register_every(self.hass, self._handle_advertisement, self.address)
+            )
+        self.entry.async_on_unload(
+            self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self._async_on_hass_stop
             )
         )
         if bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         ):
             self._schedule_connect()
+
+    @callback
+    def _handle_advertisement(
+        self, service_info: bluetooth.BluetoothServiceInfoBleak
+    ) -> None:
+        """Connect, or replace a stale proxy connection, on an advertisement."""
+        if self._stopping:
+            return
+        client = self._client
+        # A private-mode Flic advertises only while physically disconnected,
+        # so seeing one while we hold a connection means the link is stale.
+        force_reconnect = bool(
+            self.available
+            and client
+            and client.is_connected
+            and not _is_public_mode_advertisement(service_info)
+            and asyncio.get_running_loop().time() - self._available_since
+            > _STALE_LINK_GRACE_SECONDS
+        )
+        self._schedule_connect(force_reconnect=force_reconnect)
+
+    async def _async_on_hass_stop(self, _: Event) -> None:
+        """Release the button before the Bluetooth proxies are shut down."""
+        await self.async_stop()
 
     @callback
     def _schedule_connect(self, *, force_reconnect: bool = False) -> None:
@@ -168,8 +232,10 @@ class FlicDevice:
             self._connect_pending = True
             self._force_reconnect_pending |= force_reconnect
             return
+        # Not eager: every-advertisement callbacks run before the manager
+        # records the advertisement, so let the loop turn over first.
         task = self.hass.async_create_task(
-            self.async_connect(force_reconnect=force_reconnect)
+            self.async_connect(force_reconnect=force_reconnect), eager_start=False
         )
         self._connect_task = task
         task.add_done_callback(self._connect_task_done)
@@ -228,7 +294,10 @@ class FlicDevice:
                 if self._client is not disconnected_client:
                     return
                 self._client = None
+                self._session = None
                 self.available = False
+                if self._link_closed is not None:
+                    self._link_closed.set()
                 self._notify_state_listeners()
 
             try:
@@ -238,10 +307,14 @@ class FlicDevice:
                     )
             except Exception:
                 _LOGGER.exception("Unable to connect to Flic %s", self.address)
+                self._retry_not_before = (
+                    asyncio.get_running_loop().time() + _CONNECT_FAILURE_BACKOFF_SECONDS
+                )
                 if self._client:
                     with contextlib.suppress(Exception):
                         await self._client.disconnect()
                 self._client = None
+                self._session = None
                 self.available = False
                 self._notify_state_listeners()
 
@@ -278,6 +351,7 @@ class FlicDevice:
             auto_disconnect_time=_INFINITE_AUTO_DISCONNECT_TIME,
             readvertise_after_loss=True,
         )
+        self._session = session
         notification_lock = asyncio.Lock()
 
         async def _process_notification(data: bytes) -> None:
@@ -303,6 +377,7 @@ class FlicDevice:
         if session.failure:
             raise session.failure
         self.available = True
+        self._available_since = asyncio.get_running_loop().time()
         self._notify_state_listeners()
 
     @callback
@@ -353,7 +428,7 @@ class FlicDevice:
         return lambda: self._state_listeners.discard(listener)
 
     async def async_stop(self) -> None:
-        """Stop callbacks and disconnect."""
+        """Stop callbacks and release the button."""
         self._stopping = True
         connect_task = self._connect_task
         self._connect_task = None
@@ -363,10 +438,41 @@ class FlicDevice:
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await connect_task
+        await self._async_release_link()
         if self._client:
             with contextlib.suppress(Exception):
                 await self._client.disconnect()
         self._client = None
+        self._session = None
+
+    async def _async_release_link(self) -> None:
+        """Ask the button to close the link so it keeps advertising.
+
+        A link closed from the host side leaves a private-mode Flic silent
+        until its next press; a link the button closes on request is followed
+        by advertising, so it reconnects by itself after a restart or reload.
+        """
+        client = self._client
+        session = self._session
+        if not (
+            client
+            and client.is_connected
+            and session
+            and session.state is SessionState.ESTABLISHED
+        ):
+            return
+        closed = asyncio.Event()
+        self._link_closed = closed
+        try:
+            async with asyncio.timeout(_RELEASE_TIMEOUT_SECONDS):
+                await session.request_disconnect(restart_advertising=True)
+                await closed.wait()
+        except Exception as err:  # fall back to a host-side disconnect
+            _LOGGER.debug(
+                "Flic %s did not close the link on request (%s)", self.address, err
+            )
+        finally:
+            self._link_closed = None
 
 
 async def async_pair_device(
