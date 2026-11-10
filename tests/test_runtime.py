@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from custom_components.flic_ble import runtime
+from custom_components.flic_ble.protocol import PairingError
 
 
 class _FakeHass:
@@ -198,3 +199,74 @@ def test_unresolved_services_count_as_missing() -> None:
             raise RuntimeError("Service Discovery has not been performed yet")
 
     assert not runtime._has_flic_characteristics(_Unresolved())
+
+
+@pytest.mark.asyncio
+async def test_session_failure_delays_the_next_session(monkeypatch) -> None:
+    """A failed session waits out the spec's five second pause before retrying."""
+    device = _device()
+    monkeypatch.setattr(
+        runtime.bluetooth,
+        "async_ble_device_from_address",
+        lambda *args, **kwargs: object(),
+    )
+    establish_session = AsyncMock()
+    monkeypatch.setattr(device, "_async_establish_session", establish_session)
+    loop = asyncio.get_running_loop()
+    device._retry_not_before = loop.time() + 0.05
+
+    started = loop.time()
+    await device.async_connect()
+
+    establish_session.assert_awaited_once()
+    assert loop.time() - started >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_session_failure_sets_backoff_and_disconnects(monkeypatch) -> None:
+    device = _device()
+    client = SimpleNamespace(
+        is_connected=True,
+        mtu_size=100,
+        start_notify=AsyncMock(),
+        write_gatt_char=AsyncMock(),
+        disconnect=AsyncMock(),
+    )
+
+    async def _open_client(*args, **kwargs):
+        return client
+
+    monkeypatch.setattr(runtime, "_async_open_flic_client", _open_client)
+    device.entry.data.update(
+        {"pairing_identifier": 1, "pairing_key": bytes(range(16)).hex()}
+    )
+    loop = asyncio.get_running_loop()
+    session_task = asyncio.create_task(
+        device._async_establish_session(object(), lambda: object(), lambda _: None)
+    )
+    await asyncio.sleep(0)
+    notification = client.start_notify.await_args.args[1]
+
+    # The button rejecting the stored pairing fails the session.
+    notification(None, bytearray([0x20, 6]))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    with pytest.raises(PairingError):
+        await session_task
+
+    client.disconnect.assert_awaited()
+    assert device._retry_not_before > loop.time()
+
+
+def test_firmware_version_is_persisted_from_session_state() -> None:
+    device = _device()
+    updates: list[dict] = []
+    device.hass.config_entries = SimpleNamespace(
+        async_update_entry=lambda entry, data: updates.append(data)
+    )
+    result = runtime.SessionResult(firmware_version=11, adv_parameters_set=True)
+
+    device._handle_state(result)
+
+    assert updates[-1]["firmware_version"] == 11
+    assert device.readvertise_configured

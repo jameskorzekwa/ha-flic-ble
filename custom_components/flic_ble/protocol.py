@@ -36,7 +36,9 @@ OP_NO_LOGICAL_CONNECTION_SLOTS = 2
 OP_FULL_VERIFY_REQUEST_2 = 2
 OP_FULL_VERIFY_FAIL_RESPONSE = 3
 OP_QUICK_VERIFY_REQUEST = 5
+OP_GET_FIRMWARE_VERSION_RESPONSE = 5
 OP_QUICK_VERIFY_NEGATIVE_RESPONSE = 6
+OP_GET_FIRMWARE_VERSION_REQUEST = 8
 OP_QUICK_VERIFY_RESPONSE = 8
 OP_DISCONNECT_VERIFIED_LINK = 9
 OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID = 10
@@ -47,6 +49,8 @@ OP_PING_REQUEST = 15
 OP_ACK_BUTTON_EVENTS = 16
 OP_GET_BATTERY_LEVEL_RESPONSE = 20
 OP_INIT_BUTTON_EVENTS_LIGHT = 23
+OP_SET_ADV_PARAMETERS_REQUEST = 27
+OP_SET_ADV_PARAMETERS_RESPONSE = 27
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID = 30
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID = 31
 OP_BUTTON_EVENT_DUO_NOTIFICATION = 32
@@ -54,6 +58,14 @@ OP_INIT_BUTTON_EVENTS_DUO_LIGHT = 35
 OP_ACK_BUTTON_EVENTS_DUO = 36
 
 _MASK32 = 0xFFFFFFFF
+
+# ``SetAdvParametersRequest`` needs firmware 7 per the protocol specification.
+ADV_PARAMETERS_MIN_FIRMWARE: Final = 7
+# Advertising after a lost connection, matching Shortcut Labs' reference
+# implementation: 100 ms for the first five seconds, then every 8 s for a day.
+ADV_INTERVAL_FAST: Final = 160  # 0.625 ms units
+ADV_INTERVAL_SLOW: Final = 12800  # 0.625 ms units
+ADV_TIMEOUT_SECONDS: Final = 86400
 
 
 class FlicProtocolError(Exception):
@@ -143,6 +155,8 @@ class SessionResult:
     boot_id: int = 0
     battery_voltage: float | None = None
     is_duo: bool = False
+    firmware_version: int | None = None
+    adv_parameters_set: bool = False
 
 
 @dataclass(slots=True)
@@ -477,10 +491,12 @@ class FlicSession:
         event_count: int = 0,
         event_count_small: int = 0,
         boot_id: int = 0,
+        firmware_version: int | None = None,
         event_callback: Callable[[ButtonEvent], None] | None = None,
         state_callback: Callable[[SessionResult], None] | None = None,
         mtu: int = 23,
         auto_disconnect_time: int = 60,
+        readvertise_after_loss: bool = False,
     ) -> None:
         self.address = address.upper()
         self._send_gatt = send_gatt
@@ -488,11 +504,13 @@ class FlicSession:
         self._state_callback = state_callback
         self._mtu = max(23, mtu)
         self._auto_disconnect_time = min(max(auto_disconnect_time, 40), 511)
+        self._readvertise_after_loss = readvertise_after_loss
         self.result = SessionResult(
             pairing=pairing,
             event_count=event_count,
             event_count_small=event_count_small,
             boot_id=boot_id,
+            firmware_version=firmware_version,
         )
         self.state = SessionState.IDLE
         self.ready = asyncio.Event()
@@ -755,6 +773,7 @@ class FlicSession:
         self._is_duo = self.result.info.is_duo
         self.result.is_duo = self._is_duo
         self.result.battery_voltage = self.result.info.battery_voltage
+        self.result.firmware_version = firmware
         self.state = SessionState.ESTABLISHED
         self.pairing_complete.set()
         await self._send_init(full_pairing=True)
@@ -804,6 +823,38 @@ class FlicSession:
             )
         await self._send_signed(packet)
 
+    async def _async_after_init(self) -> None:
+        """Make the button keep advertising if its connection is lost.
+
+        In private mode a Flic only advertises after a button press, so a link
+        dropped by the host side (for example a Bluetooth proxy losing its API
+        connection) leaves the button silent until someone presses it, and that
+        press has to win a connection inside its short advertising window. The
+        official Flic implementations send ``SetAdvParametersRequest`` so the
+        button instead advertises on its own for a day after a lost connection;
+        the settings live in the button's RAM, so they are resent every session.
+        """
+        if not self._readvertise_after_loss:
+            return
+        if self.result.firmware_version is None:
+            await self._send_signed(bytes([OP_GET_FIRMWARE_VERSION_REQUEST]))
+            return
+        if self.result.firmware_version >= ADV_PARAMETERS_MIN_FIRMWARE:
+            await self._send_set_adv_parameters()
+
+    async def _send_set_adv_parameters(self) -> None:
+        packet = bytes([OP_SET_ADV_PARAMETERS_REQUEST]) + struct.pack(
+            "<????HHI",
+            True,  # is_active
+            False,  # remove_other_pairings_adv_settings
+            True,  # with_short_range (LE 1M PHY)
+            True,  # with_long_range (Coded PHY, the button's default)
+            ADV_INTERVAL_FAST,
+            ADV_INTERVAL_SLOW,
+            ADV_TIMEOUT_SECONDS,
+        )
+        await self._send_signed(packet)
+
     async def _handle_established(self, packet: bytes) -> None:
         opcode = packet[0]
         data = packet[1:]
@@ -822,8 +873,7 @@ class FlicSession:
                 self.result.boot_id = struct.unpack_from("<I", data, 10)[0]
             self.ready.set()
             self._notify_state()
-            if not has_queued:
-                return
+            await self._async_after_init()
         elif opcode in (
             OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID,
             OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
@@ -843,6 +893,7 @@ class FlicSession:
             self._duo_end_of_queue = not has_queued
             self.ready.set()
             self._notify_state()
+            await self._async_after_init()
         elif opcode == OP_BUTTON_EVENT_NOTIFICATION:
             if len(data) < 11:
                 return
@@ -884,6 +935,17 @@ class FlicSession:
             self.result.battery_voltage = (
                 struct.unpack_from("<H", data)[0] * 3.6 / 1024.0
             )
+            self._notify_state()
+        elif opcode == OP_GET_FIRMWARE_VERSION_RESPONSE and len(data) >= 4:
+            self.result.firmware_version = struct.unpack_from("<I", data)[0]
+            self._notify_state()
+            if (
+                self._readvertise_after_loss
+                and self.result.firmware_version >= ADV_PARAMETERS_MIN_FIRMWARE
+            ):
+                await self._send_set_adv_parameters()
+        elif opcode == OP_SET_ADV_PARAMETERS_RESPONSE:
+            self.result.adv_parameters_set = True
             self._notify_state()
         elif opcode == OP_DISCONNECT_VERIFIED_LINK:
             raise FlicProtocolError("Flic terminated the verified session")

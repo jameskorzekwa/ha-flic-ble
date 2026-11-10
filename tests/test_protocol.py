@@ -7,6 +7,15 @@ import struct
 import pytest
 
 from custom_components.flic_ble.protocol import (
+    ADV_INTERVAL_FAST,
+    ADV_INTERVAL_SLOW,
+    ADV_TIMEOUT_SECONDS,
+    OP_GET_FIRMWARE_VERSION_REQUEST,
+    OP_GET_FIRMWARE_VERSION_RESPONSE,
+    OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
+    OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
+    OP_SET_ADV_PARAMETERS_REQUEST,
+    OP_SET_ADV_PARAMETERS_RESPONSE,
     FlicSession,
     NoPairingSlotsError,
     PairingData,
@@ -331,3 +340,154 @@ def test_multiple_packet_notification() -> None:
         (0x40, bytes([0x10, 0x11])),
         (0x01, bytes([0x20, 0x21, 0x22])),
     ]
+
+
+_SESSION_KEY = bytes(range(16, 32))
+_CONN_ID = 3
+
+
+def _established_session(
+    writes: list[bytes], *, firmware_version: int | None, readvertise: bool = True
+) -> FlicSession:
+    """Return a session in the established state with a known session key."""
+
+    async def send(value: bytes) -> None:
+        writes.append(value)
+
+    session = FlicSession(
+        "01:02:03:04:05:06",
+        send,
+        pairing=PairingData(1, bytes(range(16))),
+        firmware_version=firmware_version,
+        mtu=100,
+        readvertise_after_loss=readvertise,
+    )
+    session.state = SessionState.ESTABLISHED
+    session._conn_id = _CONN_ID
+    session._session_key = _SESSION_KEY
+    return session
+
+
+def _from_button(session: FlicSession, packet: bytes) -> bytes:
+    """Sign a packet the way the button would for the next rx counter."""
+    signature = chaskey_signature(_SESSION_KEY, 0, session._rx_counter, packet)
+    return bytes([_CONN_ID]) + packet + signature
+
+
+def _init_response(*, duo: bool = False) -> bytes:
+    if duo:
+        return bytes([OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID]) + bytes(14)
+    return bytes([OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID]) + bytes(14)
+
+
+def _opcodes(writes: list[bytes]) -> list[int]:
+    return [value[1] for value in writes]
+
+
+def _expected_adv_parameters() -> bytes:
+    return bytes([OP_SET_ADV_PARAMETERS_REQUEST]) + struct.pack(
+        "<????HHI",
+        True,
+        False,
+        True,
+        True,
+        ADV_INTERVAL_FAST,
+        ADV_INTERVAL_SLOW,
+        ADV_TIMEOUT_SECONDS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_init_response_requests_advertising_after_connection_loss() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=11)
+
+    await session.feed_gatt(_from_button(session, _init_response()))
+
+    assert session.ready.is_set()
+    assert _opcodes(writes) == [OP_SET_ADV_PARAMETERS_REQUEST]
+    # conn id, signed payload, five signature bytes
+    assert writes[0][1:-5] == _expected_adv_parameters()
+    assert writes[0][-5:] == chaskey_signature(
+        _SESSION_KEY, 1, 0, _expected_adv_parameters()
+    )
+
+
+@pytest.mark.asyncio
+async def test_duo_init_response_requests_advertising_after_connection_loss() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=17)
+    session._is_duo = True
+
+    await session.feed_gatt(_from_button(session, _init_response(duo=True)))
+
+    assert session.ready.is_set()
+    assert _opcodes(writes) == [OP_SET_ADV_PARAMETERS_REQUEST]
+
+
+@pytest.mark.asyncio
+async def test_unknown_firmware_is_queried_before_advertising_parameters() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=None)
+
+    await session.feed_gatt(_from_button(session, _init_response()))
+    assert _opcodes(writes) == [OP_GET_FIRMWARE_VERSION_REQUEST]
+
+    await session.feed_gatt(
+        _from_button(
+            session,
+            bytes([OP_GET_FIRMWARE_VERSION_RESPONSE]) + struct.pack("<I", 11),
+        )
+    )
+
+    assert session.result.firmware_version == 11
+    assert _opcodes(writes) == [
+        OP_GET_FIRMWARE_VERSION_REQUEST,
+        OP_SET_ADV_PARAMETERS_REQUEST,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_old_firmware_does_not_get_advertising_parameters() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=None)
+
+    await session.feed_gatt(_from_button(session, _init_response()))
+    await session.feed_gatt(
+        _from_button(
+            session,
+            bytes([OP_GET_FIRMWARE_VERSION_RESPONSE]) + struct.pack("<I", 6),
+        )
+    )
+
+    assert session.result.firmware_version == 6
+    assert _opcodes(writes) == [OP_GET_FIRMWARE_VERSION_REQUEST]
+
+
+@pytest.mark.asyncio
+async def test_pairing_sessions_do_not_change_advertising() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=11, readvertise=False)
+
+    await session.feed_gatt(_from_button(session, _init_response()))
+
+    assert session.ready.is_set()
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_advertising_parameters_response_is_recorded() -> None:
+    writes: list[bytes] = []
+    session = _established_session(writes, firmware_version=11)
+    results = []
+    session._state_callback = results.append
+
+    await session.feed_gatt(_from_button(session, _init_response()))
+    assert not session.result.adv_parameters_set
+
+    await session.feed_gatt(
+        _from_button(session, bytes([OP_SET_ADV_PARAMETERS_RESPONSE]))
+    )
+
+    assert session.result.adv_parameters_set
+    assert results[-1].adv_parameters_set
