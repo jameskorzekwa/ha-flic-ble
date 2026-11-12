@@ -37,6 +37,18 @@ def _event_item(encoded: int, *, queued: bool = False, timestamp: int = 32768) -
     return raw.to_bytes(7, "little")
 
 
+_RAW_TYPES = {"up", "down", "small_up", "small_down"}
+
+
+def _user(events):
+    """Events other than the raw press and release ones."""
+    return [event for event in events if event.event_type not in _RAW_TYPES]
+
+
+def _types(events) -> list[str]:
+    return [event.event_type for event in events]
+
+
 def _packed_bits(*fields: tuple[int, int]) -> bytes:
     value = 0
     position = 0
@@ -74,13 +86,17 @@ def test_decode_single_double_and_hold() -> None:
         ]
     )
     events = decode_button_events(payload, 12)
-    assert [event.event_type for event in events] == ["single", "double", "hold"]
+    assert _types(_user(events)) == ["single", "double", "hold"]
+    # Every release is reported, including the one ending a double click.
+    assert _types(events) == ["up", "single", "up", "double", "hold"]
     assert all(event.timestamp_ms == 1000 for event in events)
     assert button_events_need_ack(payload)
 
 
-def test_plain_up_down_do_not_create_user_event() -> None:
-    assert decode_button_events(_event_item(0) + _event_item(1), 2) == []
+def test_plain_up_down_only_create_raw_events() -> None:
+    events = decode_button_events(_event_item(0) + _event_item(1), 2)
+    assert _types(events) == ["up", "down"]
+    assert _user(events) == []
     assert not button_events_need_ack(_event_item(0) + _event_item(1))
 
 
@@ -90,9 +106,9 @@ def test_base_flic_hold_release_does_not_emit_single() -> None:
     hold = bytes.fromhex("a2a67246ca0003")
     release = bytes.fromhex("37d27246ca000e")
 
-    assert decode_button_events(down, 153) == []
-    assert [event.event_type for event in decode_button_events(hold, 154)] == ["hold"]
-    assert decode_button_events(release, 155) == []
+    assert _types(decode_button_events(down, 153)) == ["down"]
+    assert _types(decode_button_events(hold, 154)) == ["hold"]
+    assert _types(decode_button_events(release, 155)) == ["up"]
     assert button_events_need_ack(release)
 
 
@@ -134,10 +150,10 @@ def test_decode_duo_big_single_and_swipe_left() -> None:
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
-    assert [event.event_type for event in decoded.events] == ["swipe_left"]
-    assert all(event.button == "big" for event in decoded.events)
-    assert all(event.gesture == "left" for event in decoded.events)
-    assert all(event.accelerometer == (1, -2, 3) for event in decoded.events)
+    assert _types(_user(decoded.events)) == ["swipe_left"]
+    assert all(event.button == "big" for event in _user(decoded.events))
+    assert all(event.gesture == "left" for event in _user(decoded.events))
+    assert all(event.accelerometer == (1, -2, 3) for event in _user(decoded.events))
     assert decoded.event_counts == (1, 0)
     assert decoded.last_timestamp == 5
     assert decoded.needs_ack
@@ -163,9 +179,9 @@ def test_duo_double_click_with_gesture_stays_double_click() -> None:
 
     decoded = decode_duo_button_events(payload, (100, 0), 0, True)
 
-    assert [event.event_type for event in decoded.events] == ["double"]
-    assert decoded.events[0].gesture == "down"
-    assert decoded.events[0].accelerometer == (-9, 3, 89)
+    assert _types(_user(decoded.events)) == ["double"]
+    assert _user(decoded.events)[0].gesture == "down"
+    assert _user(decoded.events)[0].accelerometer == (-9, 3, 89)
     assert decoded.event_counts == (109, 0)
     assert decoded.needs_ack
 
@@ -188,7 +204,7 @@ def test_duo_decoder_ignores_final_padding_byte() -> None:
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
-    assert [event.event_type for event in decoded.events] == ["single"]
+    assert _types(_user(decoded.events)) == ["single"]
 
 
 def test_duo_click_timeout_does_not_repeat_swipe() -> None:
@@ -208,7 +224,7 @@ def test_duo_click_timeout_does_not_repeat_swipe() -> None:
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
-    assert decoded.events == []
+    assert _user(decoded.events) == []
 
 
 def test_duo_unrecognized_gesture_preserves_click() -> None:
@@ -227,8 +243,8 @@ def test_duo_unrecognized_gesture_preserves_click() -> None:
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
-    assert [event.event_type for event in decoded.events] == ["single"]
-    assert decoded.events[0].gesture == "unrecognized"
+    assert _types(_user(decoded.events)) == ["single"]
+    assert _user(decoded.events)[0].gesture == "unrecognized"
 
 
 def test_decode_duo_small_button_hold() -> None:
@@ -246,9 +262,9 @@ def test_decode_duo_small_button_hold() -> None:
 
     decoded = decode_duo_button_events(payload, (12, 20), 100, True)
 
-    assert [event.event_type for event in decoded.events] == ["small_hold"]
-    assert decoded.events[0].button == "small"
-    assert decoded.events[0].accelerometer == (0, 64, -64)
+    assert _types(_user(decoded.events)) == ["small_hold"]
+    assert _user(decoded.events)[0].button == "small"
+    assert _user(decoded.events)[0].accelerometer == (0, 64, -64)
     assert decoded.event_counts == (12, 21)
     assert decoded.last_timestamp == 109
     assert not decoded.needs_ack
@@ -276,7 +292,7 @@ def test_decode_multiple_duo_updates_from_one_packet() -> None:
 
     decoded = decode_duo_button_events(payload, (0, 0), 0, True)
 
-    assert [event.event_type for event in decoded.events] == ["single"]
+    assert _types(_user(decoded.events)) == ["single"]
     assert decoded.event_counts == (2, 0)
     assert decoded.last_timestamp == 8
     assert decoded.needs_ack
@@ -522,3 +538,34 @@ async def test_request_disconnect_needs_an_established_session() -> None:
 
     with pytest.raises(FlicProtocolError):
         await session.request_disconnect(restart_advertising=True)
+
+
+def _duo_update(button: int, event_code: int, *, gesture: bool = False) -> list:
+    """One Duo update: first event for the button, 8-bit timestamp of 1."""
+    fields = [(button, 1), (0, 1), (0, 3), (1, 8), (event_code, 3)]
+    if event_code in (4, 7):
+        fields.append((0, 1))
+    if event_code <= 4 or event_code == 6:
+        fields.append((int(gesture), 1))
+    fields += [(0, 8), (0, 8), (0, 8)]
+    return fields
+
+
+def test_duo_reports_raw_press_and_release_per_button() -> None:
+    payload = _packed_bits(*_duo_update(1, 5), *_duo_update(0, 0)) + b"\x00"
+
+    decoded = decode_duo_button_events(payload, (0, 0), 0, True)
+
+    assert _types(decoded.events) == ["small_down", "up"]
+    assert [event.button for event in decoded.events] == ["small", "big"]
+    assert _user(decoded.events) == []
+    assert not decoded.needs_ack
+
+
+def test_duo_click_release_reports_up_then_single() -> None:
+    payload = _packed_bits(*_duo_update(0, 1)) + b"\x00"
+
+    decoded = decode_duo_button_events(payload, (0, 0), 0, True)
+
+    assert _types(decoded.events) == ["up", "single"]
+    assert decoded.needs_ack

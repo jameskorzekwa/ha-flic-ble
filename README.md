@@ -32,8 +32,10 @@ from that button.
 
 - Flic v2 round buttons
 - Flic Duo
+- Flic Twist (untested on hardware; see below)
 - Big- and small-button events on Flic Duo
-- Single, double, hold, and four-direction swipe events
+- Single, double, hold, press (`down`) and release (`up`) events
+- Four-direction swipes and push-twist rotation on Flic Duo
 
 Legacy Flic v1 buttons are not supported. Flic v1 uses a different,
 undocumented protocol and cloud-assisted pairing mechanism. Flic has sold v2
@@ -54,8 +56,8 @@ hardware for years, but older round buttons may still be v1.
 - Swipe recognition without duplicate click events
 - Hold recognition without a duplicate click on release
 
-Flic Duo push-twist, fall detection, firmware updates, and HID/MIDI
-configuration are not currently supported.
+Fall detection, firmware updates, and HID/MIDI configuration are not
+currently supported.
 
 ## Installation with HACS
 
@@ -118,16 +120,41 @@ Each button creates a Home Assistant Event entity.
 
 Round Flic buttons and the Flic Duo big button emit:
 
-- `single`
-- `double`
-- `hold`
-- `swipe_left`, `swipe_right`, `swipe_up`, and `swipe_down` on Flic Duo
+- `single`, `double`, `hold`
+- `down` (pressed) and `up` (released; every release, including the one that
+  ends a double click)
+- On Flic Duo: `swipe_left`, `swipe_right`, `swipe_up`, `swipe_down`, and
+  `rotate_clockwise` / `rotate_counter_clockwise` while the button is held
+  (push-twist). Rotation events carry `angle_degrees`, `detent_crossings`,
+  `dial_percentage` (a virtual 0-100 % dial per button), `total_turns`, `rpm`
+  and `is_first_event`. Rotation in the first 250 ms of a press is held back and
+  dropped if the press turns out to be a swipe.
 
 The Flic Duo small button uses the `small_` prefix, such as `small_single`,
-`small_hold`, and `small_swipe_left`.
+`small_hold`, `small_down`, and `small_rotate_clockwise`.
 
 Event data includes the physical button, gesture, event counter, button
 timestamp, queue status, and Duo acceleration vector when available.
+
+### Flic Twist
+
+A Flic Twist pairs like any other Flic (hold it for 6 seconds) and emits
+`single`, `double`, `hold`, `down` and `up`, plus, depending on its push-twist
+mode (Configure on the integration entry):
+
+- **Default**: `twist_increment` / `twist_decrement` and `push_twist_increment`
+  / `push_twist_decrement`, with **Twist position** and **Push twist position**
+  number entities (0-100 %) that follow the dial and can be set.
+- **Continuous**: the same turn events on one endless dial, no position entities.
+- **Selector**: `rotate_clockwise`, `rotate_counter_clockwise` and
+  `selector_changed`, with one position number entity per slot.
+
+Twist sessions use Shortcut Labs' own pyflic-ble library (vendored, Apache-2.0),
+wrapped with this integration's reconnection behaviour: every advertisement
+retries the connection, and the Twist is asked to close the link itself when
+Home Assistant stops so it keeps advertising. Flic does not publish a Twist
+protocol specification, and this support has not been tested on a physical
+Twist.
 
 ## Protocol and attribution
 

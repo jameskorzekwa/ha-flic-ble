@@ -22,11 +22,8 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, EVENT_FLIC_EVENT, EVENT_TYPES
+from .const import DOMAIN, EVENT_FLIC_EVENT, EVENT_TYPES, event_types_for
 
-# Round Flic v2 buttons emit only the big-button click gestures; the Flic Duo
-# adds swipes and the second ("small") button.
-_BASE_TRIGGERS = ("single", "double", "hold")
 TRIGGER_TYPES = set(EVENT_TYPES)
 
 TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
@@ -39,8 +36,12 @@ async def async_get_triggers(
 ) -> list[dict[str, str]]:
     """List device triggers for a Flic button."""
     device = dr.async_get(hass).async_get(device_id)
-    is_duo = bool(device and device.model == "Flic Duo")
-    types = EVENT_TYPES if is_duo else list(_BASE_TRIGGERS)
+    # Twist triggers cover both push-twist modes; the mode can change later.
+    types = event_types_for(device.model if device else None, "all")
+    if device and device.model == "Flic Twist":
+        types = list(
+            dict.fromkeys([*types, *event_types_for(device.model, "selector")])
+        )
     return [
         {
             CONF_PLATFORM: "device",

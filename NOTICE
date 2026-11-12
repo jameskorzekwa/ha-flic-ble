@@ -12,5 +12,18 @@ The original permission notice is reproduced in FLIC_LICENSE.txt. The Python
 translation is plainly marked as altered and is not represented as Shortcut
 Labs AB's original software.
 
+pyflic-ble
+----------
+
+custom_components/flic_ble/pyflic_ble/ is an unmodified copy of pyflic-ble
+0.2.6 (https://github.com/50ButtonsEach/pyflic-ble):
+
+  Copyright Shortcut Labs AB
+  Licensed under the Apache License, Version 2.0; see
+  custom_components/flic_ble/pyflic_ble/LICENSE.
+
+The Flic Duo push-twist gating in custom_components/flic_ble/rotation.py is
+adapted from that library's Flic Duo handler.
+
 Flic is a trademark of its respective owner. This project is an
 independent Home Assistant integration and is not endorsed by Flic.
