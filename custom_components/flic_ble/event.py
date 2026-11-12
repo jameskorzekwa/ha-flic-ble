@@ -8,7 +8,7 @@ from homeassistant.const import CONF_DEVICE_ID, CONF_TYPE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import EVENT_FLIC_EVENT, EVENT_TYPES
+from .const import CONF_PUSH_TWIST_MODE, EVENT_FLIC_EVENT, event_types_for, model_for
 from .entity import FlicEntity
 from .protocol import ButtonEvent
 
@@ -26,11 +26,13 @@ class FlicEventEntity(FlicEntity, EventEntity):
     """Represent click events from one Flic."""
 
     _attr_name = "Button"
-    _attr_event_types = EVENT_TYPES
 
     def __init__(self, entry: ConfigEntry) -> None:
         super().__init__(entry)
         self._attr_unique_id = f"{entry.unique_id}_button"
+        self._attr_event_types = event_types_for(
+            model_for(entry.data), entry.options.get(CONF_PUSH_TWIST_MODE)
+        )
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to protocol events."""
@@ -41,6 +43,8 @@ class FlicEventEntity(FlicEntity, EventEntity):
 
     @callback
     def _handle_event(self, event: ButtonEvent) -> None:
+        if event.event_type not in self._attr_event_types:
+            return
         event_data = {
             "button": event.button,
             "gesture": event.gesture,
@@ -48,6 +52,8 @@ class FlicEventEntity(FlicEntity, EventEntity):
             "event_count": event.event_count,
             "button_timestamp_ms": event.timestamp_ms,
         }
+        if event.data:
+            event_data.update(event.data)
         if event.accelerometer is not None:
             x, y, z = event.accelerometer
             event_data.update(

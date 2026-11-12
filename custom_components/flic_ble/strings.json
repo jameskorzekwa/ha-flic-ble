@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Choose a Flic button",
-        "description": "Hold the button for at least 6 seconds to put it in public pairing mode, then choose it below.",
+        "description": "Push and hold the Flic (button, Duo or Twist) for 6 seconds to put it in public pairing mode (1.5 seconds if it is new or was factory reset), then choose it below. It stays in pairing mode for up to 30 seconds.",
         "data": {
           "address": "Button"
         }
@@ -36,17 +36,30 @@
       "single": "Pressed",
       "double": "Double pressed",
       "hold": "Held",
+      "down": "Pressed down",
+      "up": "Released",
       "swipe_left": "Swiped left",
       "swipe_right": "Swiped right",
       "swipe_up": "Swiped up",
       "swipe_down": "Swiped down",
+      "rotate_clockwise": "Turned clockwise while held",
+      "rotate_counter_clockwise": "Turned counter-clockwise while held",
       "small_single": "Small button pressed",
       "small_double": "Small button double pressed",
       "small_hold": "Small button held",
+      "small_down": "Small button pressed down",
+      "small_up": "Small button released",
       "small_swipe_left": "Small button swiped left",
       "small_swipe_right": "Small button swiped right",
       "small_swipe_up": "Small button swiped up",
-      "small_swipe_down": "Small button swiped down"
+      "small_swipe_down": "Small button swiped down",
+      "small_rotate_clockwise": "Small button turned clockwise while held",
+      "small_rotate_counter_clockwise": "Small button turned counter-clockwise while held",
+      "twist_increment": "Twisted up",
+      "twist_decrement": "Twisted down",
+      "push_twist_increment": "Pushed and twisted up",
+      "push_twist_decrement": "Pushed and twisted down",
+      "selector_changed": "Selector changed"
     }
   },
   "entity": {
@@ -58,6 +71,26 @@
     "sensor": {
       "battery_voltage": {
         "name": "Battery voltage"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Flic Twist",
+        "description": "Choose how pushing and turning the Twist is reported.",
+        "data": {
+          "push_twist_mode": "Push-twist mode"
+        }
+      }
+    }
+  },
+  "selector": {
+    "push_twist_mode": {
+      "options": {
+        "default": "Default: separate twist and push-twist positions",
+        "continuous": "Continuous: one endless dial",
+        "selector": "Selector: push-twist picks one of 11 slots"
       }
     }
   }

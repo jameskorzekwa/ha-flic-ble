@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -11,21 +13,39 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
     CONF_BOOT_ID,
     CONF_BUTTON_UUID,
+    CONF_DEVICE_TYPE,
     CONF_EVENT_COUNT,
     CONF_EVENT_COUNT_SMALL,
     CONF_FIRMWARE_VERSION,
     CONF_IS_DUO,
     CONF_PAIRING_IDENTIFIER,
     CONF_PAIRING_KEY,
+    CONF_PUSH_TWIST_MODE,
     CONF_SERIAL_NUMBER,
+    CONF_SIG_BITS,
+    DEVICE_TYPE_TWIST,
     DOMAIN,
+    PUSH_TWIST_DEFAULT,
+    PUSH_TWIST_MODES,
     SERVICE_UUID,
+    TWIST_SERVICE_UUID,
 )
 from .protocol import (
     AuthenticationError,
@@ -36,9 +56,23 @@ from .protocol import (
     PairingTimeoutError,
     SessionState,
 )
+from .pyflic_ble import (
+    DeviceType,
+    FlicAuthenticationError,
+    FlicClient,
+    FlicPairingError,
+)
+from .pyflic_ble import FlicProtocolError as TwistProtocolError
 from .runtime import async_pair_device
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_TWIST_PAIRING_TIMEOUT = 60
+
+
+def _is_twist(info: BluetoothServiceInfoBleak) -> bool:
+    return TWIST_SERVICE_UUID in {uuid.lower() for uuid in info.service_uuids}
 
 
 def _is_supported_flic(info: BluetoothServiceInfoBleak) -> bool:
@@ -47,8 +81,39 @@ def _is_supported_flic(info: BluetoothServiceInfoBleak) -> bool:
         and (
             info.name.startswith("F2")
             or SERVICE_UUID in {uuid.lower() for uuid in info.service_uuids}
+            or _is_twist(info)
         )
     )
+
+
+async def _async_pair_twist(info: BluetoothServiceInfoBleak) -> dict[str, Any]:
+    """Pair a public-mode Flic Twist through pyflic-ble."""
+    client = FlicClient(
+        address=info.address.upper(),
+        ble_device=info.device,
+        device_type=DeviceType.TWIST,
+    )
+    try:
+        await client.connect()
+        pairing = await asyncio.wait_for(
+            client.full_verify_pairing(), timeout=_TWIST_PAIRING_TIMEOUT
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+    pairing_id, pairing_key, serial, battery, sig_bits, button_uuid, firmware = pairing
+    return {
+        CONF_ADDRESS: info.address.upper(),
+        CONF_DEVICE_TYPE: DEVICE_TYPE_TWIST,
+        CONF_PAIRING_IDENTIFIER: pairing_id,
+        CONF_PAIRING_KEY: pairing_key.hex(),
+        CONF_SERIAL_NUMBER: serial,
+        CONF_SIG_BITS: sig_bits,
+        CONF_BUTTON_UUID: button_uuid.hex()
+        if isinstance(button_uuid, bytes)
+        else str(button_uuid),
+        CONF_FIRMWARE_VERSION: firmware,
+    }
 
 
 class FlicConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -59,6 +124,18 @@ class FlicConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._devices: dict[str, BluetoothServiceInfoBleak] = {}
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Return the Flic Twist options flow."""
+        return FlicOptionsFlow()
+
+    @classmethod
+    @callback
+    def async_supports_options_flow(cls, config_entry: ConfigEntry) -> bool:
+        """Only the Flic Twist has options."""
+        return config_entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_TWIST
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -112,7 +189,26 @@ class FlicConfigFlow(ConfigFlow, domain=DOMAIN):
         if self._discovery_info is None:
             return self.async_abort(reason="no_devices_found")
         errors: dict[str, str] = {}
-        if user_input is not None:
+        if user_input is not None and _is_twist(self._discovery_info):
+            try:
+                data = await _async_pair_twist(self._discovery_info)
+            except (TimeoutError, BleakError, TwistProtocolError) as err:
+                _LOGGER.warning("Unable to connect to Flic Twist: %s", err)
+                errors["base"] = "connection_failed"
+            except FlicPairingError as err:
+                _LOGGER.warning("Unable to pair Flic Twist: %s", err)
+                errors["base"] = "pairing_rejected"
+            except FlicAuthenticationError as err:
+                _LOGGER.warning("Unable to authenticate Flic Twist: %s", err)
+                errors["base"] = "authentication_failed"
+            except Exception:
+                _LOGGER.exception("Unexpected Flic Twist pairing failure")
+                errors["base"] = "unknown"
+            else:
+                return self.async_create_entry(
+                    title=f"Flic Twist ({data[CONF_SERIAL_NUMBER]})", data=data
+                )
+        elif user_input is not None:
             try:
                 result = await async_pair_device(self.hass, self._discovery_info)
             except (BleakError, TimeoutError) as err:
@@ -174,4 +270,32 @@ class FlicConfigFlow(ConfigFlow, domain=DOMAIN):
                 "name": self._discovery_info.name,
                 "address": self._discovery_info.address.upper(),
             },
+        )
+
+
+class FlicOptionsFlow(OptionsFlow):
+    """Choose how a Flic Twist reports push-and-turn."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the push-twist mode."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        current = self.config_entry.options.get(
+            CONF_PUSH_TWIST_MODE, PUSH_TWIST_DEFAULT
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PUSH_TWIST_MODE, default=current): SelectSelector(
+                        SelectSelectorConfig(
+                            options=PUSH_TWIST_MODES,
+                            mode=SelectSelectorMode.DROPDOWN,
+                            translation_key=CONF_PUSH_TWIST_MODE,
+                        )
+                    )
+                }
+            ),
         )

@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import os
 import struct
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Final
+from typing import Any, Final
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -45,6 +46,7 @@ OP_DISCONNECT_VERIFIED_LINK = 9
 OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID = 10
 OP_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID = 11
 OP_BUTTON_EVENT_NOTIFICATION = 12
+OP_SET_CONNECTION_PARAMETERS = 12
 OP_PING_RESPONSE = 14
 OP_PING_REQUEST = 15
 OP_ACK_BUTTON_EVENTS = 16
@@ -57,10 +59,13 @@ OP_SET_ADV_PARAMETERS_REQUEST = 27
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID = 30
 OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID = 31
 OP_BUTTON_EVENT_DUO_NOTIFICATION = 32
+OP_PUSH_TWIST_DATA_NOTIFICATION = 33
 OP_INIT_BUTTON_EVENTS_DUO_LIGHT = 35
 OP_ACK_BUTTON_EVENTS_DUO = 36
+OP_ENABLE_PUSH_TWIST = 37
 
 _MASK32 = 0xFFFFFFFF
+_LOGGER = logging.getLogger(__name__)
 
 # ``SetAdvParametersRequest`` needs firmware 7 per the protocol specification.
 ADV_PARAMETERS_MIN_FIRMWARE: Final = 7
@@ -69,6 +74,11 @@ ADV_PARAMETERS_MIN_FIRMWARE: Final = 7
 ADV_INTERVAL_FAST: Final = 160  # 0.625 ms units
 ADV_INTERVAL_SLOW: Final = 12800  # 0.625 ms units
 ADV_TIMEOUT_SECONDS: Final = 86400
+# Connection parameters requested before Flic Duo push-twist is enabled, as in
+# Shortcut Labs' pyflic-ble: 100-112.5 ms interval, latency 17, 8 s timeout. A
+# Duo streams one push-twist report per connection interval while held; on a
+# Bluetooth proxy's fast default interval it closes the link instead.
+DUO_CONNECTION_PARAMETERS: Final = (80, 90, 17, 800)
 
 
 class FlicProtocolError(Exception):
@@ -145,6 +155,7 @@ class ButtonEvent:
     button: str = "big"
     gesture: str | None = None
     accelerometer: tuple[int, int, int] | None = None
+    data: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -268,6 +279,23 @@ def decode_duo_button_events(
 
         event_count = counts[button_number]
         button = "small" if button_number else "big"
+        raw_type: str | None = None
+        if event_code <= 4:
+            raw_type = "up"
+        elif event_code == 5:
+            raw_type = "down"
+        if raw_type:
+            events.append(
+                ButtonEvent(
+                    _duo_event_type(button_number, raw_type),
+                    event_count,
+                    queued,
+                    last_timestamp,
+                    button,
+                    gesture,
+                    acceleration,
+                )
+            )
         event_type: str | None = None
         double_click = False
         if event_code <= 4:
@@ -449,6 +477,12 @@ def decode_button_events(payload: bytes, final_event_count: int) -> list[ButtonE
         elif event_encoded == 7:
             next_up_double = True
 
+        if event_encoded == 1:
+            events.append(ButtonEvent("down", final_event_count, queued, timestamp_ms))
+        elif event_encoded == 0 or event_encoded & 8:
+            # Every release variant, including the one that ends a double click.
+            events.append(ButtonEvent("up", final_event_count, queued, timestamp_ms))
+
         event_type: str | None = None
         if base_type == 0:
             if single and not was_hold:
@@ -500,6 +534,7 @@ class FlicSession:
         mtu: int = 23,
         auto_disconnect_time: int = 60,
         readvertise_after_loss: bool = False,
+        push_twist_callback: Callable[[bytes], None] | None = None,
     ) -> None:
         self.address = address.upper()
         self._send_gatt = send_gatt
@@ -508,6 +543,7 @@ class FlicSession:
         self._mtu = max(23, mtu)
         self._auto_disconnect_time = min(max(auto_disconnect_time, 40), 511)
         self._readvertise_after_loss = readvertise_after_loss
+        self._push_twist_callback = push_twist_callback
         self.result = SessionResult(
             pairing=pairing,
             event_count=event_count,
@@ -605,6 +641,13 @@ class FlicSession:
         await self._send_packet(packet + signature)
 
     async def _send_packet(self, packet: bytes) -> None:
+        _LOGGER.debug(
+            "%s TX op=%d len=%d tx=%d",
+            self.address,
+            packet[0],
+            len(packet),
+            self._tx_counter,
+        )
         max_fragment = max(1, self._mtu - 4)
         if len(packet) <= self._mtu - 4:
             await self._send_gatt(bytes([self._conn_id]) + packet)
@@ -632,6 +675,16 @@ class FlicSession:
         conn_id = header & 0x1F
         newly_assigned = bool(header & 0x20)
         opcode = packet[0]
+        _LOGGER.debug(
+            "%s RX op=%d len=%d conn=%d/%d rx=%d %s",
+            self.address,
+            opcode,
+            len(packet),
+            conn_id,
+            self._conn_id,
+            self._rx_counter,
+            packet.hex() if len(packet) <= 24 else "",
+        )
 
         if opcode == OP_NO_LOGICAL_CONNECTION_SLOTS:
             ids = [x[0] for x in struct.iter_unpack("<I", packet[1:])]
@@ -910,6 +963,13 @@ class FlicSession:
             self._duo_end_of_queue = not has_queued
             self.ready.set()
             self._notify_state()
+            if self._push_twist_callback is not None:
+                await self._send_signed(
+                    bytes([OP_SET_CONNECTION_PARAMETERS])
+                    + struct.pack("<4H", *DUO_CONNECTION_PARAMETERS)
+                )
+                # Report rotation while either button is held (bit per button).
+                await self._send_signed(bytes([OP_ENABLE_PUSH_TWIST, 0b11]))
             await self._async_after_init()
         elif opcode == OP_BUTTON_EVENT_NOTIFICATION:
             if len(data) < 11:
@@ -946,6 +1006,9 @@ class FlicSession:
                     bytes([OP_ACK_BUTTON_EVENTS_DUO])
                     + struct.pack("<II", *decoded.event_counts)
                 )
+        elif opcode == OP_PUSH_TWIST_DATA_NOTIFICATION:
+            if self._push_twist_callback is not None:
+                self._push_twist_callback(data)
         elif opcode == OP_PING_REQUEST:
             await self._send_signed(bytes([OP_PING_RESPONSE]))
         elif opcode == OP_GET_BATTERY_LEVEL_RESPONSE and len(data) >= 2:

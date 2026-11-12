@@ -35,6 +35,7 @@ from .protocol import (
     SessionResult,
     SessionState,
 )
+from .rotation import DuoRotation, PushTwistData
 
 if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
@@ -147,6 +148,7 @@ class FlicDevice:
         self.battery_voltage: float | None = entry.data.get("battery_voltage")
         self._client: BleakClientWithServiceCache | None = None
         self._session: FlicSession | None = None
+        self._rotation = DuoRotation()
         self._link_closed: asyncio.Event | None = None
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
@@ -293,6 +295,7 @@ class FlicDevice:
             def _disconnected(disconnected_client: Any) -> None:
                 if self._client is not disconnected_client:
                     return
+                _LOGGER.debug("Flic %s link lost", self.address)
                 self._client = None
                 self._session = None
                 self.available = False
@@ -350,7 +353,9 @@ class FlicDevice:
             mtu=getattr(client, "mtu_size", 23),
             auto_disconnect_time=_INFINITE_AUTO_DISCONNECT_TIME,
             readvertise_after_loss=True,
+            push_twist_callback=self._handle_push_twist,
         )
+        self._rotation.reset()
         self._session = session
         notification_lock = asyncio.Lock()
 
@@ -382,6 +387,36 @@ class FlicDevice:
 
     @callback
     def _handle_event(self, event: ButtonEvent) -> None:
+        index = 1 if event.button == "small" else 0
+        if event.event_type in ("down", "small_down"):
+            self._rotation.button_down(index)
+        elif event.event_type in ("up", "small_up"):
+            self._rotation.button_up(
+                index, swiped=event.gesture in ("left", "right", "up", "down")
+            )
+        self._dispatch(event)
+
+    @callback
+    def _handle_push_twist(self, payload: bytes) -> None:
+        try:
+            report = PushTwistData.from_payload(payload)
+        except ValueError as err:
+            _LOGGER.debug("Ignoring Flic %s push-twist data: %s", self.address, err)
+            return
+        for rotation in self._rotation.push_twist(report):
+            self._dispatch(
+                ButtonEvent(
+                    rotation.event_type,
+                    self.entry.data.get(CONF_EVENT_COUNT, 0),
+                    False,
+                    0,
+                    rotation.button,
+                    data=rotation.data,
+                )
+            )
+
+    @callback
+    def _dispatch(self, event: ButtonEvent) -> None:
         for listener in tuple(self._event_listeners):
             listener(event)
 
