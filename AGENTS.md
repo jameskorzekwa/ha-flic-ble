@@ -65,6 +65,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 - A recognized swipe suppresses its underlying single click, but never a double click; swipe emitted only from the release packet to avoid duplicate/repeat on the single-click timeout (`decode_duo_button_events`).
 - Duo bitstream: stop while `unread_bytes > 1` — trailing bits + final byte are padding, not another update.
 - Signed packets use separate rx/tx counters; reordering or replaying breaks the MAC (`AuthenticationError`).
+- Re-advertise-after-loss (`_send_set_adv_parameters`, fw ≥ `ADV_PARAMETERS_MIN_FIRMWARE`) requests LE 1M PHY ONLY — `with_long_range`/Coded PHY is `False`. ESPHome proxies and most adapters cannot scan Coded PHY, so a button re-advertising only on long range is never reconnected; do NOT flip it back on. Mirrors Shortcut Labs' C/Android libs.
 - Flic v1 buttons unsupported (different undocumented protocol). Supported names start `F2`.
 - Manifest `version` must equal the git tag `vX.Y.Z` — release workflow asserts it.
 - Release archive must contain integration files at ITS ROOT (no `flic_ble/` prefix); `build_release.sh` enforces and bundles `FLIC_LICENSE.txt` + `NOTICE`.
