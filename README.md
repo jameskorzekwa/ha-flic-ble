@@ -52,6 +52,9 @@ hardware for years, but older round buttons may still be v1.
   they keep advertising when Home Assistant restarts or the entry reloads,
   and every advertisement retries the connection, so a press is not lost
   when one connection attempt fails
+- Presses a button saved while it had no usable connection are delivered
+  when it reconnects, but ones more than 30 seconds old are only logged, so
+  automations do not replay presses from hours or days earlier
 - Battery voltage reporting
 - Swipe recognition without duplicate click events
 - Hold recognition without a duplicate click on release

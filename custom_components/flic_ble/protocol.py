@@ -74,6 +74,11 @@ ADV_PARAMETERS_MIN_FIRMWARE: Final = 7
 ADV_INTERVAL_FAST: Final = 160  # 0.625 ms units
 ADV_INTERVAL_SLOW: Final = 12800  # 0.625 ms units
 ADV_TIMEOUT_SECONDS: Final = 86400
+# Presses a button queued while it had no usable link are delivered when it
+# reconnects, possibly days later. Older ones are logged but not dispatched, so
+# automations do not replay them. Measured against the button's own clock at
+# the init response, like pyflic-ble's unsynced cutoff.
+QUEUED_EVENT_MAX_AGE_MS: Final = 30_000
 # Connection parameters requested before Flic Duo push-twist is enabled, as in
 # Shortcut Labs' pyflic-ble: 100-112.5 ms interval, latency 17, 8 s timeout. A
 # Duo streams one push-twist report per connection interval while held; on a
@@ -569,6 +574,8 @@ class FlicSession:
         self._is_duo = False
         self._duo_last_timestamp = 0
         self._duo_end_of_queue = False
+        self._queued_cutoff_ms: int | None = None
+        self.stale_queued_events_dropped = 0
 
     async def start(self) -> None:
         """Start full pairing or quick verification."""
@@ -925,6 +932,31 @@ class FlicSession:
         )
         await self._send_signed(packet)
 
+    def _dispatch_events(self, events: list[ButtonEvent]) -> None:
+        """Deliver events, holding back queued ones older than the cutoff."""
+        stale = [
+            event
+            for event in events
+            if event.queued
+            and self._queued_cutoff_ms is not None
+            and event.timestamp_ms < self._queued_cutoff_ms
+        ]
+        stale_ids = {id(event) for event in stale}
+        if stale:
+            self.stale_queued_events_dropped += len(stale)
+            _LOGGER.info(
+                "%s: ignoring %d queued event(s) older than %d s: %s",
+                self.address,
+                len(stale),
+                QUEUED_EVENT_MAX_AGE_MS // 1000,
+                ", ".join(event.event_type for event in stale),
+            )
+        if not self._event_callback:
+            return
+        for event in events:
+            if id(event) not in stale_ids:
+                self._event_callback(event)
+
     async def _handle_established(self, packet: bytes) -> None:
         opcode = packet[0]
         data = packet[1:]
@@ -936,6 +968,16 @@ class FlicSession:
                 raise FlicProtocolError("Malformed init response")
             packed_time = int.from_bytes(data[:6], "little")
             has_queued = bool(packed_time & 1)
+            # Round Flic clock: 32768 Hz ticks.
+            self._queued_cutoff_ms = (
+                packed_time >> 1
+            ) * 1000 // 32768 - QUEUED_EVENT_MAX_AGE_MS
+            _LOGGER.debug(
+                "%s button clock %d ms, queued events pending: %s",
+                self.address,
+                (packed_time >> 1) * 1000 // 32768,
+                has_queued,
+            )
             self.result.event_count = struct.unpack_from("<I", data, 6)[0]
             if opcode == OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID:
                 if len(data) < 14:
@@ -952,6 +994,14 @@ class FlicSession:
                 raise FlicProtocolError("Malformed Flic Duo init response")
             packed_time = int.from_bytes(data[:6], "little")
             has_queued = bool(packed_time & 1)
+            # Flic Duo clock: milliseconds.
+            self._queued_cutoff_ms = (packed_time >> 1) - QUEUED_EVENT_MAX_AGE_MS
+            _LOGGER.debug(
+                "%s button clock %d ms, queued events pending: %s",
+                self.address,
+                packed_time >> 1,
+                has_queued,
+            )
             self.result.event_count, self.result.event_count_small = struct.unpack_from(
                 "<II", data, 6
             )
@@ -978,9 +1028,7 @@ class FlicSession:
             events = decode_button_events(data[4:], event_count)
             self.result.event_count = event_count
             self._notify_state()
-            for event in events:
-                if self._event_callback:
-                    self._event_callback(event)
+            self._dispatch_events(events)
             if button_events_need_ack(data[4:]):
                 await self._send_signed(
                     bytes([OP_ACK_BUTTON_EVENTS]) + struct.pack("<I", event_count)
@@ -998,9 +1046,7 @@ class FlicSession:
             self._duo_last_timestamp = decoded.last_timestamp
             self._duo_end_of_queue = decoded.end_of_queue
             self._notify_state()
-            for event in decoded.events:
-                if self._event_callback:
-                    self._event_callback(event)
+            self._dispatch_events(decoded.events)
             if decoded.needs_ack:
                 await self._send_signed(
                     bytes([OP_ACK_BUTTON_EVENTS_DUO])
