@@ -10,6 +10,7 @@ from custom_components.flic_ble.protocol import (
     ADV_INTERVAL_FAST,
     ADV_INTERVAL_SLOW,
     ADV_TIMEOUT_SECONDS,
+    OP_BUTTON_EVENT_NOTIFICATION,
     OP_FORCE_BT_DISCONNECT,
     OP_GET_FIRMWARE_VERSION_REQUEST,
     OP_GET_FIRMWARE_VERSION_RESPONSE,
@@ -17,6 +18,7 @@ from custom_components.flic_ble.protocol import (
     OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
     OP_SET_ADV_PARAMETERS_REQUEST,
     OP_SET_ADV_PARAMETERS_RESPONSE,
+    ButtonEvent,
     FlicProtocolError,
     FlicSession,
     NoPairingSlotsError,
@@ -569,3 +571,95 @@ def test_duo_click_release_reports_up_then_single() -> None:
 
     assert _types(decoded.events) == ["up", "single"]
     assert decoded.needs_ack
+
+
+_NOW_S = 1_000_000  # button uptime at the init response
+
+
+def _round_init_response(now_s: int = _NOW_S) -> bytes:
+    packed_time = (now_s * 32768) << 1 | 1  # has queued events
+    return (
+        bytes([OP_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID])
+        + packed_time.to_bytes(6, "little")
+        + struct.pack("<II", 0, 0)
+    )
+
+
+def _round_click(age_s: float, *, queued: bool) -> bytes:
+    ticks = int((_NOW_S - age_s) * 32768)
+    return (ticks | 2 << 48 | int(queued) << 52).to_bytes(7, "little")
+
+
+@pytest.mark.asyncio
+async def test_stale_queued_presses_are_not_dispatched() -> None:
+    """A press queued days ago must not run automations when it finally arrives."""
+    writes: list[bytes] = []
+    events: list[ButtonEvent] = []
+    session = _established_session(writes, firmware_version=11)
+    session._event_callback = events.append
+
+    await session.feed_gatt(_from_button(session, _round_init_response()))
+    await session.feed_gatt(
+        _from_button(
+            session,
+            bytes([OP_BUTTON_EVENT_NOTIFICATION])
+            + struct.pack("<I", 3)
+            + _round_click(3 * 86400, queued=True)
+            + _round_click(31, queued=True)
+            + _round_click(5, queued=True),
+        )
+    )
+
+    assert [(e.event_type, e.queued) for e in events] == [("single", True)]
+    assert events[0].timestamp_ms == (_NOW_S - 5) * 1000
+    assert session.stale_queued_events_dropped == 2
+
+
+@pytest.mark.asyncio
+async def test_live_presses_are_never_dropped_by_age() -> None:
+    writes: list[bytes] = []
+    events: list[ButtonEvent] = []
+    session = _established_session(writes, firmware_version=11)
+    session._event_callback = events.append
+
+    await session.feed_gatt(_from_button(session, _round_init_response()))
+    await session.feed_gatt(
+        _from_button(
+            session,
+            bytes([OP_BUTTON_EVENT_NOTIFICATION])
+            + struct.pack("<I", 1)
+            + _round_click(3600, queued=False),
+        )
+    )
+
+    assert [e.event_type for e in events] == ["single"]
+    assert session.stale_queued_events_dropped == 0
+
+
+@pytest.mark.asyncio
+async def test_duo_queued_cutoff_uses_millisecond_clock() -> None:
+    writes: list[bytes] = []
+    events: list[ButtonEvent] = []
+    session = _established_session(writes, firmware_version=17)
+    session._is_duo = True
+    session._event_callback = events.append
+    now_ms = 1_802_223_519
+    await session.feed_gatt(
+        _from_button(
+            session,
+            bytes([OP_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID])
+            + ((now_ms << 1) | 1).to_bytes(6, "little")
+            + struct.pack("<II", 0, 0),
+        )
+    )
+
+    session._dispatch_events(
+        [
+            ButtonEvent("double", 1, True, now_ms - 86_400_000),
+            ButtonEvent("hold", 2, True, now_ms - 10_000, button="small"),
+            ButtonEvent("single", 3, False, now_ms - 86_400_000),
+        ]
+    )
+
+    assert [e.event_type for e in events] == ["hold", "single"]
+    assert session.stale_queued_events_dropped == 1
