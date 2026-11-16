@@ -38,6 +38,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 ## CODE MAP
 `protocol.py` (no HA deps — the real work):
 - `FlicSession` — per-connection state machine. `SessionState` IDLE→WAIT_FULL_VERIFY_1/2 (new pair) or →WAIT_QUICK_VERIFY (stored pairing) →ESTABLISHED. Caller drives it: `start()`, `feed_gatt(bytes)`; awaits `pairing_complete` / `ready` events. Emits via `event_callback` / `state_callback`.
+- `_dispatch_events` — all button events route through here before `event_callback`. Drops (logs, does not fire) `ButtonEvent.queued` events whose `timestamp_ms` predates `_queued_cutoff_ms`; counts into `stale_queued_events_dropped`. Cutoff = button clock at init response minus `QUEUED_EVENT_MAX_AGE_MS` (30 s). `_handle_established` computes cutoff per button type: round clock is 32768 Hz ticks (`packed_time>>1 *1000//32768`), Duo clock is already ms.
 - `_defragment` — splits GATT notification into packets; handles 0x80 fragment bit and 0x40 multi-packet batching (first byte doubles as notification header + first packet header).
 - `chaskey_signature` / `chaskey_16` / `chaskey_subkeys` — Chaskey-LTS MAC. 5-byte signed-packet authenticator; rx/tx counters; direction byte. Translated from Flic reference (see NOTICE).
 - `_verify_button_certificate` — Ed25519 over `FLIC_ED25519_PUBLIC_KEY`; brute-forces 2 low bits of sig[32] (`sig_bits`), demands exactly one match.
@@ -59,6 +60,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 
 ## ANTI-PATTERNS / GOTCHAS (THIS PROJECT)
 - DO NOT drive automations off the event *entity's* state — use the `flic_ble_event` bus event / device triggers. A press queued while the button slept is delivered on reconnect; entity state was "unavailable" then, so a state trigger would drop it. (see `const.py` and `event.py` comments)
+- Queued presses older than `QUEUED_EVENT_MAX_AGE_MS` (30 s) are deliberately NOT dispatched — only logged — so automations do not replay hours/days-old presses on reconnect. Age is measured against the button's OWN clock at the init response (round vs Duo clocks differ), never HA wall time; all dispatch goes through `_dispatch_events`.
 - Plain button up/down does NOT emit a user event — Flic follows it with a single-click-timeout packet; wait for that (`decode_button_events`). Emitting on up creates duplicate clicks.
 - A recognized swipe suppresses its underlying single click, but never a double click; swipe emitted only from the release packet to avoid duplicate/repeat on the single-click timeout (`decode_duo_button_events`).
 - Duo bitstream: stop while `unread_bytes > 1` — trailing bits + final byte are padding, not another update.
