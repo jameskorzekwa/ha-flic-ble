@@ -410,7 +410,7 @@ def _expected_adv_parameters() -> bytes:
         True,
         False,
         True,
-        True,
+        False,  # with_long_range: proxies cannot scan Coded PHY
         ADV_INTERVAL_FAST,
         ADV_INTERVAL_SLOW,
         ADV_TIMEOUT_SECONDS,
