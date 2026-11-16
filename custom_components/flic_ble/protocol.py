@@ -925,7 +925,11 @@ class FlicSession:
             True,  # is_active
             False,  # remove_other_pairings_adv_settings
             True,  # with_short_range (LE 1M PHY)
-            True,  # with_long_range (Coded PHY, the button's default)
+            # Coded PHY advertising cannot be heard by ESPHome proxies or most
+            # adapters, so a button that re-advertises only on long range is
+            # never reconnected after a lost link. Shortcut Labs' C and Android
+            # libraries both leave it off unless the host can scan Coded PHY.
+            False,  # with_long_range
             ADV_INTERVAL_FAST,
             ADV_INTERVAL_SLOW,
             ADV_TIMEOUT_SECONDS,
