@@ -112,8 +112,7 @@ when supporting more buttons than a nearby proxy can hold.
 ### Reconnection after restarts
 
 A Flic button in private mode (measured on a Flic Duo, firmware 17) advertises,
-and so can be reconnected without a
-press, only in two cases:
+and so can be reconnected without a press, only in two cases:
 
 - After its link **times out** (the other side disappeared). This integration
   configures the button to advertise for a day afterwards.
