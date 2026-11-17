@@ -73,6 +73,7 @@ async def test_advertisement_during_attempt_schedules_follow_up() -> None:
             await first_attempt_can_finish.wait()
 
     device.async_connect = _connect
+    device._client = SimpleNamespace(is_connected=True)
     device._schedule_connect()
     await asyncio.sleep(0)
 
@@ -84,6 +85,43 @@ async def test_advertisement_during_attempt_schedules_follow_up() -> None:
             break
 
     assert attempts == [False, True]
+    if device._connect_task:
+        await device._connect_task
+
+
+@pytest.mark.asyncio
+async def test_follow_up_does_not_replace_link_opened_by_the_attempt() -> None:
+    """A stale verdict reached during an attempt must not hit the new link.
+
+    Seen live on 2026-11-17: a proxy crashed, the Duo advertised, the running
+    attempt reconnected it, and the queued follow-up then closed that fresh
+    link, which left the button silent until someone pressed it.
+    """
+    device = _device()
+    stale_client = SimpleNamespace(is_connected=True)
+    fresh_client = SimpleNamespace(is_connected=True)
+    first_attempt_can_finish = asyncio.Event()
+    attempts: list[bool] = []
+
+    async def _connect(*, force_reconnect: bool = False) -> None:
+        attempts.append(force_reconnect)
+        if len(attempts) == 1:
+            await first_attempt_can_finish.wait()
+            device._client = fresh_client
+
+    device.async_connect = _connect
+    device._client = stale_client
+    device._schedule_connect(force_reconnect=True)
+    await asyncio.sleep(0)
+
+    device._schedule_connect(force_reconnect=True)
+    first_attempt_can_finish.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if len(attempts) == 2:
+            break
+
+    assert attempts == [True, False]
     if device._connect_task:
         await device._connect_task
 
