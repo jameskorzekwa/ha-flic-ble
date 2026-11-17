@@ -153,7 +153,7 @@ class FlicDevice:
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
         self._connect_pending = False
-        self._force_reconnect_pending = False
+        self._stale_client_pending: object | None = None
         self._event_listeners: set[Callable[[ButtonEvent], None]] = set()
         self._state_listeners: set[Callable[[], None]] = set()
         self._stopping = False
@@ -232,7 +232,10 @@ class FlicDevice:
             return
         if self._connect_task is not None and not self._connect_task.done():
             self._connect_pending = True
-            self._force_reconnect_pending |= force_reconnect
+            if force_reconnect:
+                # Remember which link was judged stale, not just that one was:
+                # the running attempt may replace it with a healthy one.
+                self._stale_client_pending = self._client
             return
         # Not eager: every-advertisement callbacks run before the manager
         # records the advertisement, so let the loop turn over first.
@@ -248,10 +251,17 @@ class FlicDevice:
         if self._connect_task is task:
             self._connect_task = None
             if self._connect_pending and not self._stopping:
-                force_reconnect = self._force_reconnect_pending
+                stale_client = self._stale_client_pending
                 self._connect_pending = False
-                self._force_reconnect_pending = False
-                self._schedule_connect(force_reconnect=force_reconnect)
+                self._stale_client_pending = None
+                # Advertisements seen during the attempt condemned the link
+                # held back then. If the attempt opened a new one, closing it
+                # would silence the button: a Flic re-advertises only after a
+                # link timeout, never after a host-side disconnect.
+                self._schedule_connect(
+                    force_reconnect=stale_client is not None
+                    and stale_client is self._client
+                )
 
     async def async_connect(self, *, force_reconnect: bool = False) -> None:
         """Connect through the best available local adapter or proxy."""
@@ -468,7 +478,7 @@ class FlicDevice:
         connect_task = self._connect_task
         self._connect_task = None
         self._connect_pending = False
-        self._force_reconnect_pending = False
+        self._stale_client_pending = None
         if connect_task and connect_task is not asyncio.current_task():
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
