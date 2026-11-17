@@ -48,6 +48,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 
 `runtime.py`:
 - `FlicDevice.async_start` — registers ACTIVE bluetooth advert callback; each advert `_schedule_connect` (single-flight via `_connect_task`).
+- `_schedule_connect` — a `force_reconnect` arriving while an attempt runs records the condemned link in `_stale_client_pending` (the specific client, NOT a bool); the follow-up only forces a reconnect if that stale client is still `_client` — so a link the running attempt freshly opened is not closed.
 - `_async_establish_session` — `establish_connection` (bleak-retry, service cache), `start_notify(RX_UUID)`, feeds notifications into `FlicSession`, writes on `TX_UUID` with `response=False`.
 - `_handle_state` — persists event counts / boot_id / battery back into `entry.data` via `async_update_entry` (so queued-event replay survives restart).
 
@@ -65,6 +66,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 - A recognized swipe suppresses its underlying single click, but never a double click; swipe emitted only from the release packet to avoid duplicate/repeat on the single-click timeout (`decode_duo_button_events`).
 - Duo bitstream: stop while `unread_bytes > 1` — trailing bits + final byte are padding, not another update.
 - Signed packets use separate rx/tx counters; reordering or replaying breaks the MAC (`AuthenticationError`).
+- A Flic re-advertises only after a link TIMEOUT, never after a host-side disconnect — so NEVER force-close a healthy link. A `force_reconnect` queued behind a running attempt must be re-checked against the current `_client` (`_stale_client_pending`): if the attempt already reconnected, dropping that fresh link leaves the button silent until someone presses it.
 - Re-advertise-after-loss (`_send_set_adv_parameters`, fw ≥ `ADV_PARAMETERS_MIN_FIRMWARE`) requests LE 1M PHY ONLY — `with_long_range`/Coded PHY is `False`. ESPHome proxies and most adapters cannot scan Coded PHY, so a button re-advertising only on long range is never reconnected; do NOT flip it back on. Mirrors Shortcut Labs' C/Android libs.
 - Flic v1 buttons unsupported (different undocumented protocol). Supported names start `F2`.
 - Manifest `version` must equal the git tag `vX.Y.Z` — release workflow asserts it.
