@@ -51,6 +51,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 - `_schedule_connect` — a `force_reconnect` arriving while an attempt runs records the condemned link in `_stale_client_pending` (the specific client, NOT a bool); the follow-up only forces a reconnect if that stale client is still `_client` — so a link the running attempt freshly opened is not closed.
 - `_async_establish_session` — `establish_connection` (bleak-retry, service cache), `start_notify(RX_UUID)`, feeds notifications into `FlicSession`, writes on `TX_UUID` with `response=False`.
 - `_handle_state` — persists event counts / boot_id / battery back into `entry.data` via `async_update_entry` (so queued-event replay survives restart).
+- `async_stop(*, release=True)` / `_async_on_hass_stop` — normal stop releases the link + host disconnect; the HA-shutdown handler calls `async_stop(release=False)` to leave the link untouched (see gotcha).
 
 ## CONVENTIONS
 - `protocol.py` MUST stay free of `homeassistant` imports (kept unit-testable in isolation; tests import it directly with `pythonpath=["."]`).
@@ -67,6 +68,7 @@ FLIC_LICENSE.txt / NOTICE  # Chaskey code is a translation of Shortcut Labs' ref
 - Duo bitstream: stop while `unread_bytes > 1` — trailing bits + final byte are padding, not another update.
 - Signed packets use separate rx/tx counters; reordering or replaying breaks the MAC (`AuthenticationError`).
 - A Flic re-advertises only after a link TIMEOUT, never after a host-side disconnect — so NEVER force-close a healthy link. A `force_reconnect` queued behind a running attempt must be re-checked against the current `_client` (`_stale_client_pending`): if the attempt already reconnected, dropping that fresh link leaves the button silent until someone presses it.
+- On HA shutdown `_async_on_hass_stop` calls `async_stop(release=False)` — it does NOT release/disconnect. A clean close (either side) leaves the button silent or re-advertising only ~45 s (a restart outlasts it); letting the BLE path drop on its own makes the button see a link TIMEOUT → re-advertises for a day. Do NOT revert to releasing on HA stop.
 - Re-advertise-after-loss (`_send_set_adv_parameters`, fw ≥ `ADV_PARAMETERS_MIN_FIRMWARE`) requests LE 1M PHY ONLY — `with_long_range`/Coded PHY is `False`. ESPHome proxies and most adapters cannot scan Coded PHY, so a button re-advertising only on long range is never reconnected; do NOT flip it back on. Mirrors Shortcut Labs' C/Android libs.
 - Flic v1 buttons unsupported (different undocumented protocol). Supported names start `F2`.
 - Manifest `version` must equal the git tag `vX.Y.Z` — release workflow asserts it.
