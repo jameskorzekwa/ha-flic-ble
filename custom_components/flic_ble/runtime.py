@@ -222,8 +222,16 @@ class FlicDevice:
         self._schedule_connect(force_reconnect=force_reconnect)
 
     async def _async_on_hass_stop(self, _: Event) -> None:
-        """Release the button before the Bluetooth proxies are shut down."""
-        await self.async_stop()
+        """Stop without closing the link when Home Assistant shuts down.
+
+        A Flic keeps advertising for a day only after a link *times out*. Any
+        close from either side leaves it silent, or advertising for only about
+        45 seconds after a release, which a Home Assistant restart usually
+        outlasts. So leave the link alone and let it end with the Bluetooth
+        path: a proxy that restarts instead of closing links when Home
+        Assistant goes away makes the button see a timeout.
+        """
+        await self.async_stop(release=False)
 
     @callback
     def _schedule_connect(self, *, force_reconnect: bool = False) -> None:
@@ -472,8 +480,8 @@ class FlicDevice:
         self._state_listeners.add(listener)
         return lambda: self._state_listeners.discard(listener)
 
-    async def async_stop(self) -> None:
-        """Stop callbacks and release the button."""
+    async def async_stop(self, *, release: bool = True) -> None:
+        """Stop callbacks and, unless ``release`` is false, release the button."""
         self._stopping = True
         connect_task = self._connect_task
         self._connect_task = None
@@ -483,10 +491,11 @@ class FlicDevice:
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await connect_task
-        await self._async_release_link()
-        if self._client:
-            with contextlib.suppress(Exception):
-                await self._client.disconnect()
+        if release:
+            await self._async_release_link()
+            if self._client:
+                with contextlib.suppress(Exception):
+                    await self._client.disconnect()
         self._client = None
         self._session = None
 

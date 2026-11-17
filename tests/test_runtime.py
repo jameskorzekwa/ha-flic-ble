@@ -346,6 +346,19 @@ async def test_stop_lets_the_button_close_the_link() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_without_release_leaves_the_link_alone() -> None:
+    device = _device()
+    client, session = _established(device, closes_link=True)
+
+    await device.async_stop(release=False)
+
+    session.request_disconnect.assert_not_awaited()
+    client.disconnect.assert_not_awaited()
+    assert device._client is None
+    assert device._session is None
+
+
+@pytest.mark.asyncio
 async def test_stop_falls_back_to_host_disconnect(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "_RELEASE_TIMEOUT_SECONDS", 0.05)
     device = _device()
@@ -370,7 +383,7 @@ async def test_stop_without_session_only_disconnects() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_releases_button_when_home_assistant_stops(monkeypatch) -> None:
+async def test_home_assistant_stop_keeps_the_link(monkeypatch) -> None:
     device = _device()
     listeners: dict[str, object] = {}
     unloads: list[object] = []
@@ -392,7 +405,7 @@ async def test_start_releases_button_when_home_assistant_stops(monkeypatch) -> N
     await device.async_start()
     await listeners[runtime.EVENT_HOMEASSISTANT_STOP](object())
 
-    stop.assert_awaited_once()
+    stop.assert_awaited_once_with(release=False)
     assert len(unloads) == 2
 
 

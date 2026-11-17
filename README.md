@@ -49,9 +49,9 @@ hardware for years, but older round buttons may still be v1.
 - Persistent BLE sessions for reliable, low-latency events
 - Automatic reconnection: buttons are told to keep advertising for a day
   after a lost link (for example a Bluetooth proxy reboot), are released so
-  they keep advertising when Home Assistant restarts or the entry reloads,
-  and every advertisement retries the connection, so a press is not lost
-  when one connection attempt fails
+  they keep advertising briefly when the entry reloads, and every
+  advertisement retries the connection, so a press is not lost when one
+  connection attempt fails. See [Reconnection after restarts](#reconnection-after-restarts)
 - Presses a button saved while it had no usable connection are delivered
   when it reconnects, but ones more than 30 seconds old are only logged, so
   automations do not replay presses from hours or days earlier
@@ -108,6 +108,28 @@ bluetooth_proxy:
 
 Increase the number of slots or distribute buttons across additional proxies
 when supporting more buttons than a nearby proxy can hold.
+
+### Reconnection after restarts
+
+A Flic button in private mode (measured on a Flic Duo, firmware 17) advertises,
+and so can be reconnected without a press, only in two cases:
+
+- After its link **times out** (the other side disappeared). This integration
+  configures the button to advertise for a day afterwards.
+- For about 45 seconds after the button closes the link itself on request.
+
+When the link is closed from the Home Assistant or proxy side, the button stays
+silent until someone presses it. Upstream ESPHome Bluetooth proxies close every
+held link this way when they lose their Home Assistant connection and when a
+firmware update starts.
+
+Because of this, the integration releases buttons (the 45-second case) only
+when an entry is reloaded or removed. When Home Assistant itself stops, it
+leaves links alone so that they can end by timeout. That only happens if the
+Bluetooth path drops the link without closing it, for example an ESPHome proxy
+patched to restart instead of closing links when its API client goes away. With
+an unpatched proxy, expect to press each button once after a Home Assistant
+restart.
 
 ## Pairing
 
