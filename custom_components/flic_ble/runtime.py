@@ -53,6 +53,8 @@ class FlicDevice:
         self._client: BleakClientWithServiceCache | None = None
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
+        self._connect_pending = False
+        self._force_reconnect_pending = False
         self._event_listeners: set[Callable[[ButtonEvent], None]] = set()
         self._state_listeners: set[Callable[[], None]] = set()
         self._stopping = False
@@ -66,7 +68,13 @@ class FlicDevice:
             change: bluetooth.BluetoothChange,
         ) -> None:
             if not self._stopping:
-                self._schedule_connect()
+                client = self._client
+                # A private-mode Flic advertises only while physically
+                # disconnected. Replace a proxy client with stale link state.
+                force_reconnect = bool(
+                    self.available and client and client.is_connected
+                )
+                self._schedule_connect(force_reconnect=force_reconnect)
 
         self.entry.async_on_unload(
             bluetooth.async_register_callback(
@@ -82,13 +90,17 @@ class FlicDevice:
             self._schedule_connect()
 
     @callback
-    def _schedule_connect(self) -> None:
+    def _schedule_connect(self, *, force_reconnect: bool = False) -> None:
         """Schedule one connection attempt without building an advert backlog."""
-        if self._stopping or (
-            self._connect_task is not None and not self._connect_task.done()
-        ):
+        if self._stopping:
             return
-        task = self.hass.async_create_task(self.async_connect())
+        if self._connect_task is not None and not self._connect_task.done():
+            self._connect_pending = True
+            self._force_reconnect_pending |= force_reconnect
+            return
+        task = self.hass.async_create_task(
+            self.async_connect(force_reconnect=force_reconnect)
+        )
         self._connect_task = task
         task.add_done_callback(self._connect_task_done)
 
@@ -97,12 +109,31 @@ class FlicDevice:
         """Forget a completed connection attempt."""
         if self._connect_task is task:
             self._connect_task = None
+            if self._connect_pending and not self._stopping:
+                force_reconnect = self._force_reconnect_pending
+                self._connect_pending = False
+                self._force_reconnect_pending = False
+                self._schedule_connect(force_reconnect=force_reconnect)
 
-    async def async_connect(self) -> None:
+    async def async_connect(self, *, force_reconnect: bool = False) -> None:
         """Connect through the best available local adapter or proxy."""
         async with self._connect_lock:
-            if self._stopping or (self._client and self._client.is_connected):
+            if self._stopping:
                 return
+            current_client = self._client
+            if current_client and current_client.is_connected:
+                if not force_reconnect:
+                    return
+                _LOGGER.debug(
+                    "Replacing stale Flic connection after advertisement from %s",
+                    self.address,
+                )
+                with contextlib.suppress(Exception):
+                    await current_client.disconnect()
+                if self._client is current_client:
+                    self._client = None
+                    self.available = False
+                    self._notify_state_listeners()
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )
@@ -118,7 +149,9 @@ class FlicDevice:
                 )
 
             @callback
-            def _disconnected(_: Any) -> None:
+            def _disconnected(disconnected_client: Any) -> None:
+                if self._client is not disconnected_client:
+                    return
                 self._client = None
                 self.available = False
                 self._notify_state_listeners()
@@ -174,10 +207,12 @@ class FlicDevice:
             mtu=getattr(client, "mtu_size", 23),
             auto_disconnect_time=_INFINITE_AUTO_DISCONNECT_TIME,
         )
+        notification_lock = asyncio.Lock()
 
         async def _process_notification(data: bytes) -> None:
             try:
-                await session.feed_gatt(data)
+                async with notification_lock:
+                    await session.feed_gatt(data)
             except Exception as err:
                 _LOGGER.warning("Flic session failed for %s: %s", self.address, err)
                 if self._client is client:
@@ -241,6 +276,8 @@ class FlicDevice:
         self._stopping = True
         connect_task = self._connect_task
         self._connect_task = None
+        self._connect_pending = False
+        self._force_reconnect_pending = False
         if connect_task and connect_task is not asyncio.current_task():
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
